@@ -250,7 +250,7 @@ def main():
         
     msg = model.load_state_dict(state_dict, strict=False)
     print(f"Loaded weights with msg: {msg}")
-
+    model.eval()
     if opt.get("split_seed", -1) > 0:
         opt["data"]["train"] = copy.deepcopy(opt["data"][args.target_set])
         opt["data"]["eval"] = copy.deepcopy(opt["data"][args.target_set])
