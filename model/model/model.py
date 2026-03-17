@@ -1,5 +1,5 @@
 import contextlib
-from transformers import LlamaForCausalLM, LlamaTokenizer#, BertLMHeadModel
+from transformers import LlamaForCausalLM, LlamaTokenizer, BertModel
 
 import torch
 from torch import nn
@@ -35,12 +35,53 @@ def disabled_train(self, mode=True):
     does not change anymore."""
     return self
 
+class CrossAttentionPooling(nn.Module):
+    def __init__(self, text_dim, visual_dim, embed_dim, num_heads=8):
+        super().__init__()
+        # 将文本特征投影为 Query
+        self.q_proj = nn.Linear(text_dim, embed_dim)
+        # 将视觉时空 Token 投影为 Key 和 Value
+        self.k_proj = nn.Linear(visual_dim, embed_dim)
+        self.v_proj = nn.Linear(visual_dim, embed_dim)
+        
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        
+        # 前馈网络 (FFN) 增加非线性表达能力
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim * 4),
+            nn.GELU(),
+            nn.Linear(embed_dim * 4, embed_dim)
+        )
+        self.norm2 = nn.LayerNorm(embed_dim)
 
+    def forward(self, text_feat, visual_tokens):
+        """
+        text_feat: [B, text_dim] (Semantic Anchor)
+        visual_tokens: [B, T*H*W, visual_dim] (Unpooled 3D features)
+        """
+        # [B, text_dim] -> [B, 1, embed_dim]
+        q = self.q_proj(text_feat).unsqueeze(1) 
+        # [B, T*H*W, visual_dim] -> [B, T*H*W, embed_dim]
+        k = self.k_proj(visual_tokens)
+        v = self.v_proj(visual_tokens)
+        
+        # 交叉注意力计算
+        attn_out, _ = self.attn(q, k, v)  # 输出形状: [B, 1, embed_dim]
+        
+        # 残差连接与归一化
+        out = self.norm1(q + attn_out)
+        ffn_out = self.ffn(out)
+        out = self.norm2(out + ffn_out)
+        
+        # 去掉序列维度，返回池化后的对齐特征: [B, embed_dim]
+        return out.squeeze(1)
 class GateMixer(nn.Module):
     def __init__(
         self,
         v_in_dim,
         c_in_dim,
+        text_dim,  # 新增文本特征维度
         d,
         token_len=32,
         prefix_len=8,
@@ -51,7 +92,9 @@ class GateMixer(nn.Module):
         self.prefix_len = prefix_len
         self.w1_v = nn.Linear(v_in_dim, d)
         self.w1_c = nn.Linear(c_in_dim, d)
-        self.w_g = nn.Linear(2 * d, d)
+        # 门控全连接层现在接收：Swin特征(d) + Conv特征(d) + 文本特征(text_dim)
+        self.w_g = nn.Linear(2 * d + text_dim, d) 
+        
         if prefix_len > 0:
             self.h_p = nn.Parameter(torch.zeros(1, prefix_len, d))
             nn.init.normal_(self.h_p, mean=0.0, std=0.02)
@@ -59,11 +102,17 @@ class GateMixer(nn.Module):
             self.h_p = None
         self.w2 = nn.Linear(d, out_dim or d)
 
-    def forward(self, v_v, v_c):
+    def forward(self, v_v, v_c, text_feat):
         h_v = self.w1_v(v_v).unsqueeze(1).expand(-1, self.token_len, -1)
         h_c = self.w1_c(v_c).unsqueeze(1).expand(-1, self.token_len, -1)
-        alpha_v = torch.sigmoid(self.w_g(torch.cat([h_v, h_c], dim=-1)))
+        
+        # 将文本特征也扩展到序列长度参与门控计算
+        text_feat_exp = text_feat.unsqueeze(1).expand(-1, self.token_len, -1)
+        
+        # 模型现在可以根据 Prompt 决定倾向于全局结构还是局部纹理
+        alpha_v = torch.sigmoid(self.w_g(torch.cat([h_v, h_c, text_feat_exp], dim=-1)))
         h = (1 - alpha_v) * h_v + alpha_v * h_c
+        
         if self.h_p is not None:
             h = torch.cat([self.h_p.expand(h.size(0), -1, -1), h], dim=1)
         return self.w2(h)
@@ -99,6 +148,13 @@ class T2VQA(nn.Module):
 
         # 把 BLIP text_encoder 输出投到 embed_dim（后续作为多帧语义 token）
         self.finetune_text_proj = nn.Linear(self.blip.text_encoder.config.hidden_size, embed_dim)
+        # 新增一个纯文本编码器提取语义锚点
+        # 加载标准的 bert-base-uncased，默认 add_cross_attention 是 False
+        self.pure_text_encoder = BertModel.from_pretrained(args['bert_weights'])
+        
+        # 冻结这个纯文本编码器（视显存情况而定，建议冻结）
+        for param in self.pure_text_encoder.parameters():
+            param.requires_grad = False
 
         # ---------- 语言模型（LLM） ----------
         # LLM 本体冻结，仅用作“把多模态 token + 文本 prompt”映射到质量词的 logits
@@ -164,18 +220,24 @@ class T2VQA(nn.Module):
         print(self.swin3d.load_state_dict(i_state_dict, strict=False))
         
         #自适应平均池化，指定输出的尺寸
-        self.swin_avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        # self.swin_avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
 
         self.conv3d = convnext_3d_tiny(
             pretrained=args.get("conv_pretrained", False),
             in_22k=args.get("conv_in_22k", False),
             checkpoint=args.get("conv_weights", None),
         )
-        self.conv_avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        # self.conv_avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+
+        # 新增交叉注意力池化器 (假设 Swin3D 和 ConvNext3D 输出通道都是 768)
+        text_hidden_size = self.blip.text_encoder.config.hidden_size
+        self.swin_attn_pool = CrossAttentionPooling(text_dim=text_hidden_size, visual_dim=768, embed_dim=embed_dim)
+        self.conv_attn_pool = CrossAttentionPooling(text_dim=text_hidden_size, visual_dim=768, embed_dim=embed_dim)
 
         self.gate_mixer = GateMixer(
-            v_in_dim=768,
-            c_in_dim=768,
+            v_in_dim=embed_dim,    # 注意这里改为了 embed_dim，因为 attn_pool 输出是 embed_dim
+            c_in_dim=embed_dim,    
+            text_dim=text_hidden_size, # 传入文本维度
             d=embed_dim,
             token_len=args.get("gatemixer_token_len", 32),
             prefix_len=args.get("gatemixer_prefix_len", 8),
@@ -184,6 +246,7 @@ class T2VQA(nn.Module):
 
         # 将 5 个等级映射到数值权重（1~5），用于把 5 个词的概率加权成最终分数
         self.weights = torch.Tensor([[1], [2], [3], [4], [5]])
+
 
     def quality_regression(self,in_channels, middle_channels, out_channels):
         regression_block = nn.Sequential(
@@ -242,17 +305,36 @@ class T2VQA(nn.Module):
         self.llm_model.load_state_dict(remapped_state, strict=False)
 
     def forward(self, data, caption, prompt):
-
         video = data['video']
 
-        # ---------- 技术质量 token（Swin3D -> 32 个 query token） ----------
-        f_swin = self.swin3d(video)
-        f_swin = self.swin_avg_pool(f_swin).view(video.size(0), -1)
+        # 1. 优先获取全局纯文本特征作为 Semantic Anchor
+        text = self.blip.tokenizer(caption, padding='max_length', truncation=True, max_length=35, return_tensors="pt").to(video.device)
+        
+        # BLIP text_encoder 不传 encoder_hidden_states 时充当纯文本编码器
+        # 使用专门的纯文本编码器提取
+        text_output = self.pure_text_encoder(text.input_ids, attention_mask=text.attention_mask, return_dict=True)
+        global_text_feat = text_output.last_hidden_state[:, 0, :] # [B, text_dim]
 
-        f_conv = self.conv3d(video)
-        f_conv = self.conv_avg_pool(f_conv).view(video.size(0), -1)
+        # 2. 技术质量特征：用 Cross-Attention Pooling 替代 AvgPool 展平
+        f_swin = self.swin3d(video) # 原始形状: [B, C, T, H, W]
+        B, C_s, T_s, H_s, W_s = f_swin.shape
+        # 展平为 [B, T*H*W, C] 
+        f_swin_flat = f_swin.view(B, C_s, -1).transpose(1, 2) 
+        # 文本引导对齐
+        pooled_swin = self.swin_attn_pool(global_text_feat, f_swin_flat) # [B, embed_dim]
 
-        inputs_swin = self.gate_mixer(f_swin, f_conv).to(video.device)
+        f_conv = self.conv3d(video) # 原始形状: [B, C, T, H, W]
+        B, C_c, T_c, H_c, W_c = f_conv.shape
+        # 展平为 [B, T*H*W, C]
+        f_conv_flat = f_conv.view(B, C_c, -1).transpose(1, 2)
+        # 文本引导对齐
+        pooled_conv = self.conv_attn_pool(global_text_feat, f_conv_flat) # [B, embed_dim]
+
+        # 3. 文本条件引导的 GateMixer
+        # inputs_swin 此时包含高度对齐的时空技术质量 tokens
+        inputs_swin = self.gate_mixer(pooled_swin, pooled_conv, global_text_feat)
+        
+        # ... 后续保留你原有的多帧语义 Token 提取和 LLM 逻辑不变 ...
         atts_swin = torch.ones(inputs_swin.size()[:-1], dtype=torch.long).to(video.device)
 
         inputs_llm = []

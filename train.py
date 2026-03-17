@@ -183,7 +183,7 @@ def inference_set(
                 if (
                     "finetune" in key
                     or "swin" in key
-                    or "conv3d" in key
+                    or "conv" in key
                     or "gate_mixer" in key
                     or "slowfast" in key
                     or "blip.text_encoder" in key
@@ -398,7 +398,7 @@ def main():
 
         # 精准解锁模型中的特定子模块，允许它们在训练过程中更新参数。
         for key, value in dict(model.named_children()).items():
-            if "finetune" in key or "swin" in key or "conv3d" in key or "gate_mixer" in key or "slowfast" in key:
+            if "finetune" in key or "swin" in key or "conv" in key or "gate_mixer" in key or "slowfast" in key:
                 for param in value.parameters():
                     param.requires_grad = True
 
