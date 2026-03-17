@@ -13,7 +13,7 @@ import pickle
 import math
 import yaml
 from collections import OrderedDict
-
+import json
 from functools import reduce
 from thop import profile
 import copy
@@ -76,6 +76,7 @@ def finetune_epoch(
     epoch=-1,
 ):
     model.train()
+    total_loss = 0.0  # 新增：用于累加当前 epoch 的总 loss
     for i, data in enumerate(tqdm(ft_loader, desc=f"Training in epoch {epoch}")):
         optimizer.zero_grad()
         video = {}
@@ -107,8 +108,11 @@ def finetune_epoch(
         scheduler.step()
 
         # ft_loader.dataset.refresh_hypers()
+        total_loss += loss.item()  # 新增：累加 loss
 
     model.eval()
+    avg_loss = total_loss / len(ft_loader)  # 新增：计算平均 loss
+    return avg_loss  # 新增：返回当前轮次的平均 loss
 
 def inference_set(
     inf_loader,
@@ -208,7 +212,8 @@ def inference_set(
         f"For {len(inf_loader)} videos, \nthe accuracy of the model: [{suffix}] is as follows:\n  SROCC: {s:.4f} best: {best_s:.4f} \n  PLCC:  {p:.4f} best: {best_p:.4f}  \n  KROCC: {k:.4f} best: {best_k:.4f} \n  RMSE:  {r:.4f} best: {best_r:.4f}."
     )
 
-    return best_s, best_p, best_k, best_r
+    return (best_s, best_p, best_k, best_r), (s, p, k, r)
+
 
 def main():
     # 参数解析器
@@ -341,11 +346,14 @@ def main():
         bests = {}
         for key in val_loaders:
             bests[key] = -1, -1, -1, 1000
-        
+        history_log = []  # 新增：初始化用于记录所有轮次数据的列表
         for epoch in range(opt["num_epochs"]):
             print(f"End-to-end Epoch {epoch}:")
+            epoch_train_loss = 0.0  
+            
             for key, train_loader in train_loaders.items():
-                finetune_epoch(
+                # 接收当前 epoch 的训练 loss
+                epoch_train_loss = finetune_epoch(
                     train_loader,
                     model,
                     optimizer,
@@ -353,8 +361,16 @@ def main():
                     device,
                     epoch,
                 )
+            
+            # 初始化当前 epoch 的数据字典
+            epoch_data = {
+                "epoch": epoch,
+                "train_loss": epoch_train_loss
+            }
+
             for key in val_loaders:
-                bests[key] = inference_set(
+                # 拆包接收历史最佳指标和当前指标
+                bests[key], current_metrics = inference_set(
                     val_loaders[key],
                     model,
                     device,
@@ -364,17 +380,21 @@ def main():
                     suffix=key + "_s",
                     save_type="head",
                 )
-
-        if opt["num_epochs"] >= 0:
-            for key in val_loaders:
-                print(
-                    f"""For the end-to-end transfer process on {key} with {len(val_loaders[key])} videos,
-                    the best validation accuracy of the model-s is as follows:
-                    SROCC: {bests[key][0]:.4f}
-                    PLCC:  {bests[key][1]:.4f}
-                    KROCC: {bests[key][2]:.4f}
-                    RMSE:  {bests[key][3]:.4f}."""
-                )
+                
+                # 将当前轮次的各项指标提取到字典中
+                s, p, k, r = current_metrics
+                epoch_data[f"val_{key}_SRCC"] = float(s)
+                epoch_data[f"val_{key}_PLCC"] = float(p)
+                epoch_data[f"val_{key}_KRCC"] = float(k)
+                epoch_data[f"val_{key}_RMSE"] = float(r)
+            
+            # 将当前轮次数据加入总记录中
+            history_log.append(epoch_data)
+            
+            # 每一轮结束将纯数据落盘保存（覆盖更新），无需保存模型权重
+            with open(f"training_history_split{split}.json", "w", encoding="utf-8") as f:
+                json.dump(history_log, f, indent=4)
+            
 
         # 精准解锁模型中的特定子模块，允许它们在训练过程中更新参数。
         for key, value in dict(model.named_children()).items():
