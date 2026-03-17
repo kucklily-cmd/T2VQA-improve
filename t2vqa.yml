@@ -1,0 +1,70 @@
+name: T2VQA
+num_epochs: 30
+warmup_epochs: 2.5
+save_model: true
+batch_size: 4
+num_workers: 6
+# split_seed: -1
+split_seed: 1
+
+wandb:
+    project_name: T2VQA
+
+data:   
+    train:
+        type: T2VDataset
+        args:
+            phase: train
+            # anno_file: /root/autodl-tmp/info_sub5000_train4000.txt
+            anno_file: /root/autodl-tmp/info.txt
+            data_prefix: /root/autodl-tmp/T2VQA-DB
+            size: 224
+            clip_len: 8
+            frame_interval: 2
+
+    eval:
+        type: T2VDataset
+        args:
+            phase: test
+            anno_file: /root/autodl-tmp/info_sub5000_val500.txt
+            data_prefix: /root/autodl-tmp/T2VQA-DB
+            size: 224
+            clip_len: 8
+            frame_interval: 2
+
+    t2v:
+        type: T2VDataset
+        args:
+            phase: test
+            anno_file: /root/autodl-tmp/info.txt
+            data_prefix: /root/autodl-tmp/T2VQA-DB
+            size: 224
+            clip_len: 8
+            frame_interval: 2
+
+
+
+model:
+    args:
+        med_config: '/root/autodl-tmp/T2VQA-main/med_config.json'
+        image_size: 224
+        nhead: 8
+        dropout: 0.1
+        nlayers: 6
+        embed_dim: 256 
+        llm_model: /root/autodl-tmp/model/vicuna-7b-v1.1
+        blip_weights: /root/autodl-tmp/model/model_large.pth
+        swin_weights: /root/autodl-tmp/model/swin_tiny_patch244_window877_kinetics400_1k.pth
+        conv_weights: /root/autodl-tmp/model/convnext_3d_tiny_3.pth
+        bert_weights: /root/autodl-tmp/model/bert-base-uncased
+        visual_safetensors_index: "/root/autodl-tmp/T2VQA-main/model.safetensors.index.json"
+            
+optimizer:
+    lr: !!float 1e-5
+    wd: 0.05
+        
+
+test_load_path: "/root/autodl-tmp/T2VQA-main/pretrained_weights/baseline.pth"
+
+    
+        
