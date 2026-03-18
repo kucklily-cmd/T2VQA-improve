@@ -302,19 +302,19 @@ def main():
             )
 
         # 利用参数组实现部分更新的策略
+        # 利用参数组实现部分更新的策略
         param_groups = []   
 
         for name, param in model.named_parameters():
-            
+            # 这里收集的是在整个训练周期内（包括阶段一和阶段二）需要更新的所有参数
             if (
                 "finetune" in name
                 or "swin" in name
-                or "conv3d" in name
+                or "conv" in name
                 or "gate_mixer" in name
-                or "slowfast" in name
+                or "attn_pool" in name
                 or "blip.text_encoder" in name
             ):
-
                 param_groups += [
                         {"params": param, "lr": opt["optimizer"]["lr"]}
                 ]
@@ -348,6 +348,38 @@ def main():
             bests[key] = -1, -1, -1, 1000
         history_log = []  # 新增：初始化用于记录所有轮次数据的列表
         for epoch in range(opt["num_epochs"]):
+            history_log = []  # 新增：初始化用于记录所有轮次数据的列表
+        
+        stage1_epochs = 5  # 定义第一阶段（模态对齐）的 epoch 数量，可根据需要调整
+
+        for epoch in range(opt["num_epochs"]):
+            print(f"\n================ End-to-end Epoch {epoch} ================")
+            
+            # ---------------- 核心：二阶段动态解冻机制 ----------------
+            if epoch < stage1_epochs:
+                print(f"--> [阶段 1] 模态空间对齐：冻结视觉骨干，仅训练投影与融合层")
+                for name, param in model.named_parameters():
+                    # 仅开启我们新建的对齐模块
+                    if "finetune" in name or "gate_mixer" in name or "attn_pool" in name:
+                        param.requires_grad = True
+                    else:
+                        param.requires_grad = False
+            else:
+                print(f"--> [阶段 2] 全面微调：解冻视觉和文本骨干网络")
+                for name, param in model.named_parameters():
+                    # 解冻所有需要微调的模块
+                    if (
+                        "finetune" in name
+                        or "swin" in name
+                        or "conv" in name
+                        or "gate_mixer" in name
+                        or "attn_pool" in name
+                        or "blip.text_encoder" in name
+                    ):
+                        param.requires_grad = True
+                    else:
+                        param.requires_grad = False
+            # --------------------------------------------------------
             print(f"End-to-end Epoch {epoch}:")
             epoch_train_loss = 0.0  
             

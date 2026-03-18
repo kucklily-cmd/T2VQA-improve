@@ -134,7 +134,6 @@ class T2VDataset(Dataset):
         return len(self.video_infos)
 
     def __getitem__(self, index):
-
         video_info = self.video_infos[index]
         filename = video_info["filename"]
         prompt = video_info["prompt"]
@@ -142,25 +141,38 @@ class T2VDataset(Dataset):
         
         vreader = VideoReader(filename)
         
+        # 按照 t2vqa.yml 中的配置 (建议 clip_len=32) 密集采样
         frame_inds = self.sampler(len(vreader), self.phase == "train")
         frame_dict = {idx: vreader[idx] for idx in np.unique(frame_inds)}
 
         imgs = [frame_dict[idx] for idx in frame_inds]
         img_shape = imgs[0].shape
-        # 将三维度图片列表，沿着时间轴变成，四维度的视频向量
+        
+        # 转换为 [C, T, H, W] 的浮点型张量
         video = torch.stack(imgs, 0)
-        # 维度重排
-        video = video.permute(3, 0, 1, 2)
-        # 空间缩放为224×224
-        video = torch.nn.functional.interpolate(video, size=(self.size, self.size))
-        # 转换维度，高斯归一化
-        vfrag = ((video.permute(1, 2, 3, 0) - self.mean) / self.std).permute(3, 0, 1, 2)
+        video = video.permute(3, 0, 1, 2).float() 
+        # 空间缩放为 224×224
+        video_tensor = torch.nn.functional.interpolate(video, size=(self.size, self.size))
+
+        # ==================== 1. 语义一致性分支 (全局 + 低帧率) ====================
+        num_semantic_frames = 8
+        T = video_tensor.shape[1]
+        if T >= num_semantic_frames:
+            interval = T // num_semantic_frames
+            video_semantic = video_tensor[:, ::interval, :, :][:, :num_semantic_frames, :, :]
+        else:
+            video_semantic = video_tensor
+
+        # ==================== 2. 运动保真度分支 (全局 + 高帧率) ====================
+        # 放弃裁切，直接把高频采样的 32 帧 224x224 完整送入模型
+        video_fidelity = video_tensor
 
         data = {
-            "video": vfrag,  # B, T, C, H, W
-            "prompt": prompt,
-            "frame_inds": frame_inds,
-            "gt_label": label,
+            'video_fidelity': video_fidelity,  # [C, 32, 224, 224]
+            'video_semantic': video_semantic,  # [C, 8, 224, 224]
+            'frame_inds': frame_inds,
+            'prompt': prompt,  
+            'gt_label': label,
             "original_shape": img_shape,
         }
         
