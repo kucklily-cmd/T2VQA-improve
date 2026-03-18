@@ -305,33 +305,27 @@ class T2VQA(nn.Module):
         self.llm_model.load_state_dict(remapped_state, strict=False)
 
     def forward(self, data, caption, prompt):
-        video = data['video']
+        # 提取两路视频张量
+        video_fidelity = data['video_fidelity'] # [B, 3, 32, 112, 112]
+        video_semantic = data['video_semantic'] # [B, 3, 8, 224, 224]
 
-        # 1. 优先获取全局纯文本特征作为 Semantic Anchor
-        text = self.blip.tokenizer(caption, padding='max_length', truncation=True, max_length=35, return_tensors="pt").to(video.device)
-        
-        # BLIP text_encoder 不传 encoder_hidden_states 时充当纯文本编码器
-        # 使用专门的纯文本编码器提取
+        # ---------- 1. 获取全局纯文本特征作为 Semantic Anchor ----------
+        text = self.blip.tokenizer(caption, padding='max_length', truncation=True, max_length=35, return_tensors="pt").to(video_fidelity.device)
         text_output = self.pure_text_encoder(text.input_ids, attention_mask=text.attention_mask, return_dict=True)
-        global_text_feat = text_output.last_hidden_state[:, 0, :] # [B, text_dim]
+        global_text_feat = text_output.last_hidden_state[:, 0, :]
 
-        # 2. 技术质量特征：用 Cross-Attention Pooling 替代 AvgPool 展平
-        f_swin = self.swin3d(video) # 原始形状: [B, C, T, H, W]
+        # ---------- 2. 技术质量特征：喂入高帧率 Fragment 张量 ----------
+        f_swin = self.swin3d(video_fidelity) 
         B, C_s, T_s, H_s, W_s = f_swin.shape
-        # 展平为 [B, T*H*W, C] 
         f_swin_flat = f_swin.view(B, C_s, -1).transpose(1, 2) 
-        # 文本引导对齐
-        pooled_swin = self.swin_attn_pool(global_text_feat, f_swin_flat) # [B, embed_dim]
+        pooled_swin = self.swin_attn_pool(global_text_feat, f_swin_flat)
 
-        f_conv = self.conv3d(video) # 原始形状: [B, C, T, H, W]
+        f_conv = self.conv3d(video_fidelity) 
         B, C_c, T_c, H_c, W_c = f_conv.shape
-        # 展平为 [B, T*H*W, C]
         f_conv_flat = f_conv.view(B, C_c, -1).transpose(1, 2)
-        # 文本引导对齐
-        pooled_conv = self.conv_attn_pool(global_text_feat, f_conv_flat) # [B, embed_dim]
-
+        pooled_conv = self.conv_attn_pool(global_text_feat, f_conv_flat)
         # 3. 文本条件引导的 GateMixer
-        # inputs_swin 此时包含高度对齐的时空技术质量 tokens
+        # GateMixer 融合
         inputs_swin = self.gate_mixer(pooled_swin, pooled_conv, global_text_feat)
         
         # ... 后续保留你原有的多帧语义 Token 提取和 LLM 逻辑不变 ...
@@ -344,29 +338,20 @@ class T2VQA(nn.Module):
         text = self.blip.tokenizer(caption, padding='max_length', truncation=True, max_length=35, 
                                   return_tensors="pt").to(video.device)
         
-        # ---------- 多帧语义 token（逐帧：视觉 encoder + text_encoder cross-attn） ----------
-        # 这个video是数据加载器封装的五个维度的那个
-        for j in range(video.size(2)):#size（2）获取第三个维度的内容
-            #遍历每一帧
-            image = video[:,:,j,:,:]
-
+        inputs_llm = []
+        for j in range(video_semantic.size(2)): # 这里按照 8 帧遍历
+            image = video_semantic[:,:,j,:,:]
+            
             image_embeds = self.blip.visual_encoder(image)
+            image_atts = torch.ones(image_embeds.size()[:-1], dtype=torch.long).to(video_semantic.device)
 
-            # 给图像 embedding 构造一个 全1的 attention mask
-            image_atts = torch.ones(image_embeds.size()[:-1],dtype=torch.long).to(video.device)
-
-            # 交叉注意力机制
             output = self.blip.text_encoder(text.input_ids,
-                                                attention_mask = text.attention_mask,
-                                                encoder_hidden_states = image_embeds,
-                                                encoder_attention_mask = image_atts,
-                                                return_dict = True,
-                                            )
+                                            attention_mask = text.attention_mask,
+                                            encoder_hidden_states = image_embeds,
+                                            encoder_attention_mask = image_atts,
+                                            return_dict = True)
 
-            # 取 [CLS] 作为该帧的语义摘要 token
             output = self.finetune_text_proj(output.last_hidden_state[:,0,:])
-
-
             inputs_llm.append(output)
 
         semantic_tokens = torch.stack(inputs_llm, dim=1)

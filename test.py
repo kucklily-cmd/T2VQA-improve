@@ -82,7 +82,8 @@ def finetune_epoch(
     for i, data in enumerate(tqdm(ft_loader, desc=f"Training in epoch {epoch}")):
         optimizer.zero_grad()
         video = {}
-        video["video"] = data["video"].to(device)
+        video["video_fidelity"] = data["video_fidelity"].to(device)
+        video["video_semantic"] = data["video_semantic"].to(device)
         video["frame_inds"] = data["frame_inds"].to(device)
 
         y = data["gt_label"].float().detach().to(device)

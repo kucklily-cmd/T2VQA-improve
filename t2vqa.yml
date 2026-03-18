@@ -19,8 +19,8 @@ data:
             anno_file: /root/autodl-tmp/info.txt
             data_prefix: /root/autodl-tmp/T2VQA-DB
             size: 224
-            clip_len: 8
-            frame_interval: 2
+            clip_len: 32
+            frame_interval: 1
 
     eval:
         type: T2VDataset
