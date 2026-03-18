@@ -163,7 +163,7 @@ def inference_set(
     r = np.sqrt(((gt_labels - pr_labels) ** 2).mean())
 
     # wandb.log(
-    #     {
+    #     {finetune_epoch
     #         f"val_{suffix}/SRCC-{suffix}": s,
     #         f"val_{suffix}/PLCC-{suffix}": p,
     #         f"val_{suffix}/KRCC-{suffix}": k,
@@ -216,7 +216,7 @@ def inference_set(
 
 
 def main():
-    # 参数解析器
+    # 参数解析器param_groups = []
     # 解析命令行传入参数格式 python train.py --opt my_config.yml
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -301,24 +301,18 @@ def main():
                 pin_memory=True,
             )
 
-        # 利用参数组实现部分更新的策略
+        # 1. 初始化优化器时，收集全部潜在需要微调的参数
         param_groups = []   
-
         for name, param in model.named_parameters():
-            
             if (
                 "finetune" in name
                 or "swin" in name
                 or "conv3d" in name
                 or "gate_mixer" in name
-                or "slowfast" in name
+                or "attn_pool" in name       # 加入注意力池化层的跟踪
                 or "blip.text_encoder" in name
             ):
-
-                param_groups += [
-                        {"params": param, "lr": opt["optimizer"]["lr"]}
-                ]
-
+                param_groups += [{"params": param, "lr": opt["optimizer"]["lr"]}]
 
         optimizer = torch.optim.AdamW(
             lr=opt["optimizer"]["lr"],
@@ -342,17 +336,38 @@ def main():
         #控制哪一个优化器，自定义学习率策略
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda,)
 
-        # python元组存储四个不同的指标
         bests = {}
         for key in val_loaders:
             bests[key] = -1, -1, -1, 1000
-        history_log = []  # 新增：初始化用于记录所有轮次数据的列表
+        history_log = []  
+        
+        stage1_epochs = 5  # 定义阶段一的轮数
+        
         for epoch in range(opt["num_epochs"]):
-            print(f"End-to-end Epoch {epoch}:")
-            epoch_train_loss = 0.0  
+            print(f"\n================ End-to-end Epoch {epoch} ================")
             
+            # ---------------- 核心：动态解冻机制 ----------------
+            if epoch < stage1_epochs:
+                print(f"--> [Stage 1] 模态空间对齐：冻结骨干网络，仅训练投影与融合层")
+                for name, param in model.named_parameters():
+                    if "finetune" in name or "gate_mixer" in name or "attn_pool" in name:
+                        param.requires_grad = True
+                    else:
+                        param.requires_grad = False
+            else:
+                print(f"--> [Stage 2] 全面微调：解冻视觉和文本骨干网络")
+                for name, param in model.named_parameters():
+                    if (
+                        "finetune" in name or "swin" in name or "conv3d" in name 
+                        or "gate_mixer" in name or "attn_pool" in name or "blip.text_encoder" in name
+                    ):
+                        param.requires_grad = True
+                    else:
+                        param.requires_grad = False
+            # --------------------------------------------------
+
+            epoch_train_loss = 0.0  
             for key, train_loader in train_loaders.items():
-                # 接收当前 epoch 的训练 loss
                 epoch_train_loss = finetune_epoch(
                     train_loader,
                     model,
@@ -396,11 +411,11 @@ def main():
                 json.dump(history_log, f, indent=4)
             
 
-        # 精准解锁模型中的特定子模块，允许它们在训练过程中更新参数。
-        for key, value in dict(model.named_children()).items():
-            if "finetune" in key or "swin" in key or "conv" in key or "gate_mixer" in key or "slowfast" in key:
-                for param in value.parameters():
-                    param.requires_grad = True
+        # 精准解锁模型中的特定子模块
+        for name, param in model.named_parameters():
+            if ("finetune" in name or "swin" in name or "conv3d" in name 
+                or "gate_mixer" in name or "attn_pool" in name or "blip.text_encoder" in name):
+                param.requires_grad = True
 
         #清理结尾
         del model

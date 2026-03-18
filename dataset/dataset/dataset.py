@@ -141,69 +141,36 @@ class T2VDataset(Dataset):
         
         vreader = VideoReader(filename)
         
-        # 此时 sampler 应该根据 t2vqa.yml 的 clip_len=32 采样 32 帧
         frame_inds = self.sampler(len(vreader), self.phase == "train")
         frame_dict = {idx: vreader[idx] for idx in np.unique(frame_inds)}
 
         imgs = [frame_dict[idx] for idx in frame_inds]
         img_shape = imgs[0].shape
         
-        # 将三维度图片列表，沿着时间轴变成，四维度的视频向量 [T, H, W, C]
+        # 将图片堆叠并进行空间缩放、高斯归一化
         video = torch.stack(imgs, 0)
-        # 维度重排变为 [C, T, H, W]，并转换为 float 类型（这一步非常重要，否则后面的相减计算会报错或溢出）
-        video = video.permute(3, 0, 1, 2).float() 
-        # 空间缩放为 224×224，此时 video_tensor 的维度是 [C, 32, 224, 224]
-        video_tensor = torch.nn.functional.interpolate(video, size=(self.size, self.size))
+        video = video.permute(3, 0, 1, 2).float()
+        video = torch.nn.functional.interpolate(video, size=(self.size, self.size))
+        vfrag = ((video.permute(1, 2, 3, 0) - self.mean) / self.std).permute(3, 0, 1, 2)
 
-        # ==================== 1. 语义一致性分支 (全局 + 低帧率) ====================
-        # 我们从 32 帧中均匀抽取 8 帧，保留 224x224 的完整空间视野
+        # ==================== 1. 语义一致性分支 (均匀下采样 8 帧) ====================
         num_semantic_frames = 8
-        T = video_tensor.shape[1]
+        T = vfrag.shape[1]
         if T >= num_semantic_frames:
             interval = T // num_semantic_frames
-            # 加上前缀索引抽取 8 帧
-            video_semantic = video_tensor[:, ::interval, :, :][:, :num_semantic_frames, :, :]
+            video_semantic = vfrag[:, ::interval, :, :][:, :num_semantic_frames, :, :]
         else:
-            video_semantic = video_tensor
+            video_semantic = vfrag
 
-        # ==================== 2. 运动保真度分支 (Fragment + 高帧率) ====================
-        # 强烈建议使用 128 而不是 112，因为 128 能被 32 整除，防止 ConvNext 下采样报错
-        crop_size = 128  
-        _, _, H, W = video_tensor.shape
+        # ==================== 2. 运动保真度分支 (全分辨率 16 帧密集采样) ====================
+        video_fidelity = vfrag
 
-        # 计算整段视频的“运动显著性” (通过相邻帧的绝对差值来衡量运动幅度)
-        if T > 1:
-            # 相邻帧相减并取绝对值，然后在通道和时间维度求平均，得到 [H, W] 的运动热图
-            motion_map = torch.mean(torch.abs(video_tensor[:, 1:, :, :] - video_tensor[:, :-1, :, :]), dim=(0, 1))
-        else:
-            motion_map = torch.mean(video_tensor, dim=(0, 1))
-
-        # 定义 5 个候选 Fragment 区域 (四个角 + 中心)
-        candidates = [
-            (0, 0), (0, W - crop_size), 
-            (H - crop_size, 0), (H - crop_size, W - crop_size),
-            ((H - crop_size) // 2, (W - crop_size) // 2)
-        ]
-
-        # 找到运动得分最高的一个 Patch
-        best_score = -1
-        best_h, best_w = 0, 0
-        for (h_start, w_start) in candidates:
-            score = torch.mean(motion_map[h_start:h_start+crop_size, w_start:w_start+crop_size]).item()
-            if score > best_score:
-                best_score = score
-                best_h, best_w = h_start, w_start
-
-        # 截取最具运动显著性的所有帧的 128x128 视频块 -> [C, 32, 128, 128]
-        video_fidelity = video_tensor[:, :, best_h:best_h+crop_size, best_w:best_w+crop_size]
-
-        # ==================== 组装返回数据 ====================
         data = {
-            'video_fidelity': video_fidelity,  # [C, 32, 128, 128]
-            'video_semantic': video_semantic,  # [C, 8, 224, 224]
-            'frame_inds': frame_inds,
-            'prompt': prompt,  # 修改为你头部定义的变量名 prompt
-            'gt_label': label,
+            "video_fidelity": video_fidelity,  # [C, 16, H, W]
+            "video_semantic": video_semantic,  # [C, 8, H, W]
+            "prompt": prompt,
+            "frame_inds": frame_inds,
+            "gt_label": label,
             "original_shape": img_shape,
         }
         

@@ -19,7 +19,7 @@ data:
             anno_file: /root/autodl-tmp/info.txt
             data_prefix: /root/autodl-tmp/T2VQA-DB
             size: 224
-            clip_len: 32
+            clip_len: 16
             frame_interval: 1
 
     eval:
@@ -29,8 +29,8 @@ data:
             anno_file: /root/autodl-tmp/info_sub5000_val500.txt
             data_prefix: /root/autodl-tmp/T2VQA-DB
             size: 224
-            clip_len: 8
-            frame_interval: 2
+            clip_len: 16
+            frame_interval: 1
 
     t2v:
         type: T2VDataset
@@ -39,8 +39,8 @@ data:
             anno_file: /root/autodl-tmp/info.txt
             data_prefix: /root/autodl-tmp/T2VQA-DB
             size: 224
-            clip_len: 8
-            frame_interval: 2
+            clip_len: 16
+            frame_interval: 1
 
 
 
