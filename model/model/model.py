@@ -329,14 +329,14 @@ class T2VQA(nn.Module):
         inputs_swin = self.gate_mixer(pooled_swin, pooled_conv, global_text_feat)
         
         # ... 后续保留你原有的多帧语义 Token 提取和 LLM 逻辑不变 ...
-        atts_swin = torch.ones(inputs_swin.size()[:-1], dtype=torch.long).to(video.device)
+        atts_swin = torch.ones(inputs_swin.size()[:-1], dtype=torch.long).to(video_fidelity.device)
 
         inputs_llm = []
 
         #人类能看懂的句子（caption）转换成模型能处理的数字矩阵（Tokens），并统一所有句子的长度。
         #将字符串拆分成“词元”（Tokens）。例如把 "A cat is running" 拆解并映射为词表中的索引数字，如 [101, 134, 567, ...]。
         text = self.blip.tokenizer(caption, padding='max_length', truncation=True, max_length=35, 
-                                  return_tensors="pt").to(video.device)
+                                  return_tensors="pt").to(video_fidelity.device)
         
         inputs_llm = []
         for j in range(video_semantic.size(2)): # 这里按照 8 帧遍历
@@ -359,16 +359,15 @@ class T2VQA(nn.Module):
         fidelity_tokens = self.finetune_fidelity_proj(inputs_swin)
 
         inputs_llm = torch.cat([fidelity_tokens, semantic_tokens], dim=1)
-        atts_llm = torch.ones(inputs_llm.size()[:-1], dtype=torch.long).to(video.device)
+        atts_llm = torch.ones(inputs_llm.size()[:-1], dtype=torch.long).to(video_fidelity.device)
 
         
-        # LLM提示词转换为数字矩阵
         llm_tokens = self.llm_tokenizer(
         # ---------- 文本提示词 token（prompt） ----------
-            [prompt] * video.size(0),# 将同一个字符串 prompt 重复B次，组成一个列表。
-            padding="longest",# 自动补长
-            return_tensors="pt"# 返回pt张量
-        ).to(video.device)
+            [prompt] * video_fidelity.size(0), # 将同一个字符串 prompt 重复B次
+            padding="longest",
+            return_tensors="pt"
+        ).to(video_fidelity.device)
 
         # 是否开启混合精度
         with self.maybe_autocast():
@@ -396,7 +395,7 @@ class T2VQA(nn.Module):
         q_pred = (torch.stack([lexcellent, lgood, lfair, lpoor, lbad]) / 100).softmax(0)
 
         #加权得分
-        weights = self.weights.expand(-1, q_pred.shape[1]).to(video.device)
+        weights = self.weights.expand(-1, q_pred.shape[1]).to(video_fidelity.device)
         q_pred = torch.mul(q_pred, weights)
 
         q_pred = torch.sum(q_pred, dim=0)

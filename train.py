@@ -134,10 +134,9 @@ def inference_set(
         result = dict()
         video, video_up = {}, {}
 
-        video['video'] = data['video'].to(device)
-        
-        ## Reshape into clips
-        b, c, t, h, w = video['video'].shape
+        video["video_fidelity"] = data["video_fidelity"].to(device)
+        video["video_semantic"] = data["video_semantic"].to(device)
+        video["frame_inds"] = data["frame_inds"].to(device)
             
         with torch.no_grad():
             prompt = 'Please assess the quality of this video'
