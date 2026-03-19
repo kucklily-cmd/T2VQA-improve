@@ -60,11 +60,18 @@ def rank_loss(y_pred, y):
 
 # 待看
 def rescale(pr, gt=None):
-
+    pr = np.array(pr)
+    gt = np.array(gt) if gt is not None else None
+    
+    std_pr = np.std(pr)
+    # 【新增保护】：如果标准差接近0，强行赋予一个极小值，防止除以0产生 NaN
+    if std_pr < 1e-8:
+        std_pr = 1e-8 
+        
     if gt is None:
-        pr = (pr - np.mean(pr)) / np.std(pr)
+        pr = (pr - np.mean(pr)) / std_pr
     else:
-        pr = ((pr - np.mean(pr)) / np.std(pr)) * np.std(gt) + np.mean(gt)
+        pr = ((pr - np.mean(pr)) / std_pr) * np.std(gt) + np.mean(gt)
     return pr
 
 def finetune_epoch(
@@ -153,14 +160,25 @@ def inference_set(
         results.append(result)
 
     ## generate the demo video for video quality localization
+    ## generate the demo video for video quality localization
     gt_labels = [r["gt_label"] for r in results]
     pr_labels = [np.mean(r["pr_labels"]) for r in results]
+    
+    # 【新增保护 1】：将网络可能输出的极端异常值强制归零
+    pr_labels = np.nan_to_num(pr_labels, nan=0.0, posinf=0.0, neginf=0.0)
+    
     pr_labels = rescale(pr_labels, gt_labels)
 
-    s = spearmanr(gt_labels, pr_labels)[0]
-    p = pearsonr(gt_labels, pr_labels)[0]
-    k = kendallr(gt_labels, pr_labels)[0]
-    r = np.sqrt(((gt_labels - pr_labels) ** 2).mean())
+    # 【新增保护 2】：如果处理后数组是常数（方差为0），直接跳过相关性计算赋予 0 分
+    if np.std(pr_labels) < 1e-8 or np.std(gt_labels) < 1e-8:
+        print("\n[Warning] 模型当前预测呈同质化(常数)，跳过指标计算以防崩溃...")
+        s, p, k = 0.0, 0.0, 0.0
+    else:
+        s = spearmanr(gt_labels, pr_labels)[0]
+        p = pearsonr(gt_labels, pr_labels)[0]
+        k = kendallr(gt_labels, pr_labels)[0]
+        
+    r = np.sqrt(((np.array(gt_labels) - np.array(pr_labels)) ** 2).mean())
 
     # wandb.log(
     #     {finetune_epoch

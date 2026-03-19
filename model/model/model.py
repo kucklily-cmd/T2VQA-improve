@@ -373,7 +373,8 @@ class T2VQA(nn.Module):
         output_logits = outputs.logits[:, -1]
         lexcellent, lgood, lfair, lpoor, lbad = output_logits[:, self.excellent_idx], output_logits[:, self.good_idx], output_logits[:, self.fair_idx], output_logits[:,self.poor_idx], output_logits[:, self.bad_idx]
 
-        q_pred = (torch.stack([lexcellent, lgood, lfair, lpoor, lbad]) / 100).softmax(0)
+        # 强制将 FP16 的 logits 转换为 FP32 再进行除法和 softmax，防止底层数值溢出
+        q_pred = (torch.stack([lexcellent, lgood, lfair, lpoor, lbad]).float() / 100).softmax(0)
         weights = self.weights.expand(-1, q_pred.shape[1]).to(video_fidelity.device)
         q_pred = torch.mul(q_pred, weights)
         q_pred = torch.sum(q_pred, dim=0)
