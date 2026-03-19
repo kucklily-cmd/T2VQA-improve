@@ -322,15 +322,12 @@ def main():
         # 1. 初始化优化器时，收集全部潜在需要微调的参数
         param_groups = []   
         for name, param in model.named_parameters():
-            if (
-                "finetune" in name
-                or "swin" in name
-                or "conv3d" in name
-                or "gate_mixer" in name
-                or "attn_pool" in name       # 加入注意力池化层的跟踪
-                or "blip.text_encoder" in name
-            ):
+            if "finetune" in name or "gate_mixer" in name or "attn_pool" in name:
+        # 投影层/融合层使用配置文件中的主学习率
                 param_groups += [{"params": param, "lr": opt["optimizer"]["lr"]}]
+            elif "swin" in name or "conv3d" in name or "blip.text_encoder" in name:
+                # 预训练骨干网络使用极小的学习率 (比如主学习率的十分之一)
+                param_groups += [{"params": param, "lr": opt["optimizer"]["lr"] * 0.1}]
 
         optimizer = torch.optim.AdamW(
             lr=opt["optimizer"]["lr"],
