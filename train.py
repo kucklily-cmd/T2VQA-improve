@@ -319,18 +319,29 @@ def main():
                 pin_memory=True,
             )
 
-        # 1. 初始化优化器时，收集全部潜在需要微调的参数
+       # ================= 核心修改：差异化学习率与端到端解冻 =================
         param_groups = []   
+        
+        # 针对不同模块，分配不同的学习率
+        lr_new_modules = 1e-4  # 随机初始化的新模块，需要较大的学习率快速收敛
+        lr_pretrained = 1e-5   # 预训练好的骨干网络，使用极小的学习率微调，防止遗忘
+        
         for name, param in model.named_parameters():
+            # 1. 我们自己新建的、随机初始化的模块 (高学习率)
             if "finetune" in name or "gate_mixer" in name or "attn_pool" in name:
-        # 投影层/融合层使用配置文件中的主学习率
-                param_groups += [{"params": param, "lr": opt["optimizer"]["lr"]}]
+                param.requires_grad = True
+                param_groups.append({"params": param, "lr": lr_new_modules})
+                
+            # 2. 预训练的视觉与文本骨干网络 (低学习率)
             elif "swin" in name or "conv3d" in name or "blip.text_encoder" in name:
-                # 预训练骨干网络使用极小的学习率 (比如主学习率的十分之一)
-                param_groups += [{"params": param, "lr": opt["optimizer"]["lr"] * 0.1}]
+                param.requires_grad = True
+                param_groups.append({"params": param, "lr": lr_pretrained})
+                
+            # 3. 庞大的 LLM 本体依然保持冻结
+            else:
+                param.requires_grad = False
 
         optimizer = torch.optim.AdamW(
-            lr=opt["optimizer"]["lr"],
             params=param_groups,
             weight_decay=opt["optimizer"]["wd"],
         )
@@ -356,31 +367,11 @@ def main():
             bests[key] = -1, -1, -1, 1000
         history_log = []  
         
-        stage1_epochs = 5  # 定义阶段一的轮数
-        
+        # 彻底废弃 stage1_epochs 的 if-else 冻结逻辑，直接进行端到端循环
         for epoch in range(opt["num_epochs"]):
             print(f"\n================ End-to-end Epoch {epoch} ================")
+            print("--> 端到端联合训练：视觉骨干(1e-5) 与 融合层(1e-4) 协同优化中...")
             
-            # ---------------- 核心：动态解冻机制 ----------------
-            if epoch < stage1_epochs:
-                print(f"--> [Stage 1] 模态空间对齐：冻结骨干网络，仅训练投影与融合层")
-                for name, param in model.named_parameters():
-                    if "finetune" in name or "gate_mixer" in name or "attn_pool" in name:
-                        param.requires_grad = True
-                    else:
-                        param.requires_grad = False
-            else:
-                print(f"--> [Stage 2] 全面微调：解冻视觉和文本骨干网络")
-                for name, param in model.named_parameters():
-                    if (
-                        "finetune" in name or "swin" in name or "conv3d" in name 
-                        or "gate_mixer" in name or "attn_pool" in name or "blip.text_encoder" in name
-                    ):
-                        param.requires_grad = True
-                    else:
-                        param.requires_grad = False
-            # --------------------------------------------------
-
             epoch_train_loss = 0.0  
             for key, train_loader in train_loaders.items():
                 epoch_train_loss = finetune_epoch(
