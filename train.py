@@ -310,23 +310,32 @@ def main():
             )
 
         # 利用参数组实现部分更新的策略
+        # 利用参数组实现部分更新的策略，赋予不同模块不同的学习率
         param_groups = []   
 
         for name, param in model.named_parameters():
-            
-            if (
+            if not param.requires_grad:
+                continue
+                
+            # 1. 如果是 LoRA 的参数，给予较大的学习率 (例如 1e-4)
+            if "lora" in name:
+                param_groups.append({
+                    "params": param, 
+                    "lr": 1e-4  # LoRA 专用学习率
+                })
+            # 2. 如果是视觉编码器、门控融合等其他可训练参数，使用配置文件中的基础学习率 (1e-5)
+            elif (
                 "finetune" in name
                 or "swin" in name
                 or "conv3d" in name
                 or "gate_mixer" in name
                 or "slowfast" in name
                 or "blip.text_encoder" in name
-                or "lora" in name  # <--- 新增对 LoRA 权重的捕捉
             ):
-
-                param_groups += [
-                        {"params": param, "lr": opt["optimizer"]["lr"]}
-                ]
+                param_groups.append({
+                    "params": param, 
+                    "lr": opt["optimizer"]["lr"]  # 读取 yml 里的 1e-5
+                })
 
 
         optimizer = torch.optim.AdamW(

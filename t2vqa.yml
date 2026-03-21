@@ -1,9 +1,9 @@
 name: T2VQA
-num_epochs: 30
-warmup_epochs: 2.5
+num_epochs: 10
+warmup_epochs: 0.5
 save_model: true
-batch_size: 4
-num_workers: 6
+batch_size: 2
+num_workers: 8
 # split_seed: -1
 split_seed: 1
 
@@ -15,22 +15,23 @@ data:
         type: T2VDataset
         args:
             phase: train
-            # anno_file: /root/autodl-tmp/info_sub5000_train4000.txt
+            # anno_file: /root/autodl-tmp/trainFix.txt
             anno_file: /root/autodl-tmp/info.txt
             data_prefix: /root/autodl-tmp/T2VQA-DB
             size: 224
-            clip_len: 8
-            frame_interval: 2
+            clip_len: 16 
+            frame_interval: 1
 
     eval:
         type: T2VDataset
         args:
             phase: test
-            anno_file: /root/autodl-tmp/info_sub5000_val500.txt
+            # anno_file: /root/autodl-tmp/info_sub5000_val500.txt
+            anno_file: /root/autodl-tmp/testFix.txt
             data_prefix: /root/autodl-tmp/T2VQA-DB
             size: 224
-            clip_len: 8
-            frame_interval: 2
+            clip_len: 16
+            frame_interval: 1
 
     t2v:
         type: T2VDataset
@@ -39,8 +40,8 @@ data:
             anno_file: /root/autodl-tmp/info.txt
             data_prefix: /root/autodl-tmp/T2VQA-DB
             size: 224
-            clip_len: 8
-            frame_interval: 2
+            clip_len: 16
+            frame_interval: 1
 
 
 
@@ -68,3 +69,4 @@ test_load_path: "/root/autodl-tmp/T2VQA-main/pretrained_weights/baseline.pth"
 
     
         
+    
