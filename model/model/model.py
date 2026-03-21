@@ -1,6 +1,7 @@
 import contextlib
 from transformers import LlamaForCausalLM, LlamaTokenizer, BertModel
-
+# 文件开头增加导入
+from peft import LoraConfig, get_peft_model, TaskType
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -182,11 +183,22 @@ class T2VQA(nn.Module):
         self.finetune_semantic_proj = nn.Linear(embed_dim, self.llm_model.config.hidden_size)
         self.finetune_fidelity_proj = nn.Linear(embed_dim, self.llm_model.config.hidden_size)
         
-        #保证llm在训练过程中不变化
-        for name, param in self.llm_model.named_parameters():#获取里面所有变量（模型参数nn.Parameter）
-                param.requires_grad = False#关闭梯度
-        self.llm_model = self.llm_model.eval()
-        self.llm_model.train = disabled_train
+        # 冻结 LLM 原始参数
+        for name, param in self.llm_model.named_parameters():
+            param.requires_grad = False
+            
+        # 引入 LoRA (Low-Rank Adaptation)
+        lora_config = LoraConfig(
+            r=16,               # 秩大小，控制显存开销。若显存充足可调为 16 或 32
+            lora_alpha=16,
+            target_modules=["q_proj", "v_proj"], # LLaMA 常见的微调注意力层
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM"
+        )
+        self.llm_model = get_peft_model(self.llm_model, lora_config)
+        self.llm_model.print_trainable_parameters() # 在控制台打印 LoRA 带来的参数量
+        # 注：使用 LoRA 时，不要再覆盖 self.llm_model.train 为 disabled_train
 
         # 最终从 LLM 的 vocab logits 中取这 5 个词的打分
         # 词表中五个单词转换为数字列表
@@ -377,12 +389,18 @@ class T2VQA(nn.Module):
         atts_llm = torch.ones(inputs_llm.size()[:-1], dtype=torch.long).to(video.device)
 
         
+        # ---------- 文本提示词 token（prompt） ----------
+        # 兼容静态字符串或动态构建的列表输入
+        if isinstance(prompt, str):
+            prompts_list = [prompt] * video.size(0)
+        else:
+            prompts_list = list(prompt)
+
         # LLM提示词转换为数字矩阵
         llm_tokens = self.llm_tokenizer(
-        # ---------- 文本提示词 token（prompt） ----------
-            [prompt] * video.size(0),# 将同一个字符串 prompt 重复B次，组成一个列表。
-            padding="longest",# 自动补长
-            return_tensors="pt"# 返回pt张量
+            prompts_list,
+            padding="longest",
+            return_tensors="pt"
         ).to(video.device)
 
         # 是否开启混合精度

@@ -85,11 +85,12 @@ def finetune_epoch(
 
         y = data["gt_label"].float().detach().to(device)
 
-        caption = data['prompt']
-        
-        prompt = 'Please assess the quality of this video'
-
-        scores = model(video, caption = caption, prompt = prompt)
+        captions = data['prompt']
+        prompts = [
+            f"The user provided the text prompt: '{c}' to generate a video. Please assess the overall quality of this generated video, considering both text-video alignment and visual fidelity." 
+            for c in captions
+        ]
+        scores = model(video, caption=captions, prompt=prompts)
 
         y_pred = scores
         # if len(scores) > 1:
@@ -139,11 +140,18 @@ def inference_set(
         b, c, t, h, w = video['video'].shape
             
         with torch.no_grad():
-            prompt = 'Please assess the quality of this video'
+            # 原代码：
+            # prompt = 'Please assess the quality of this video'
+            # caption = data['prompt']
+            # result["pr_labels"] = model(video, caption = caption, prompt = prompt).cpu().numpy()
 
-            caption = data['prompt']
-
-            result["pr_labels"] = model(video, caption = caption, prompt = prompt).cpu().numpy()
+            # 替换为：
+            captions = data['prompt']
+            prompts = [
+                f"The user provided the text prompt: '{c}' to generate a video. Please assess the overall quality of this generated video, considering both text-video alignment and visual fidelity." 
+                for c in captions
+            ]
+            result["pr_labels"] = model(video, caption=captions, prompt=prompts).cpu().numpy()
 
             if len(list(video_up.keys())) > 0:
                 result["pr_labels_up"] = model(video_up).cpu().numpy()
@@ -313,6 +321,7 @@ def main():
                 or "gate_mixer" in name
                 or "slowfast" in name
                 or "blip.text_encoder" in name
+                or "lora" in name  # <--- 新增对 LoRA 权重的捕捉
             ):
 
                 param_groups += [
