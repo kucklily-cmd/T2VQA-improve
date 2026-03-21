@@ -49,7 +49,12 @@ def plcc_loss(y_pred, y):
     loss1 = torch.nn.functional.mse_loss(rho * y_pred, y) / 4
     return ((loss0 + loss1) / 2).float()
 
+# 修改后
 def rank_loss(y_pred, y):
+    # 扩展维度变成 [B, 1] 才能实现 NxN 的矩阵差分广播
+    y_pred = y_pred.unsqueeze(1) 
+    y = y.unsqueeze(1)
+    
     ranking_loss = torch.nn.functional.relu(
         (y_pred - y_pred.t()) * torch.sign((y.t() - y))
     )
