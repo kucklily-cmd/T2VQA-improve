@@ -147,6 +147,20 @@ class T2VQA(nn.Module):
             else:
                 param.requires_grad = False
 
+        # ======= 【新增】为 BLIP 的视觉编码器 (ViT) 添加 LoRA =======
+        #from peft import LoraConfig, get_peft_model
+        #lora_config_vit = LoraConfig(
+         #    r=16,
+          #   lora_alpha=16,
+           #  target_modules=["qkv"], # Vision Transformer 常用的注意力层投影矩阵
+            # lora_dropout=0.05,
+          #bias="none"
+         #)
+        #self.blip.visual_encoder = get_peft_model(self.blip.visual_encoder, lora_config_vit)
+        #print("BLIP Visual Encoder LoRA Parameters:")
+        #self.blip.visual_encoder.print_trainable_parameters()
+     # ==========================================================
+
         # 把 BLIP text_encoder 输出投到 embed_dim（后续作为多帧语义 token）
         self.finetune_text_proj = nn.Linear(self.blip.text_encoder.config.hidden_size, embed_dim)
         # 新增一个纯文本编码器提取语义锚点
@@ -187,18 +201,8 @@ class T2VQA(nn.Module):
         for name, param in self.llm_model.named_parameters():
             param.requires_grad = False
             
-        # 引入 LoRA (Low-Rank Adaptation)
-        lora_config = LoraConfig(
-            r=16,               # 秩大小，控制显存开销。若显存充足可调为 16 或 32
-            lora_alpha=16,
-            target_modules=["q_proj", "v_proj"], # LLaMA 常见的微调注意力层
-            lora_dropout=0.05,
-            bias="none",
-            task_type="CAUSAL_LM"
-        )
-        self.llm_model = get_peft_model(self.llm_model, lora_config)
-        self.llm_model.print_trainable_parameters() # 在控制台打印 LoRA 带来的参数量
-        # 注：使用 LoRA 时，不要再覆盖 self.llm_model.train 为 disabled_train
+        self.llm_model.eval() # 新增：强制 LLM 处于推理模式
+    
 
         # 最终从 LLM 的 vocab logits 中取这 5 个词的打分
         # 词表中五个单词转换为数字列表

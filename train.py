@@ -40,16 +40,25 @@ def train_test_split(dataset_path, ann_file, ratio=0.8, seed=42):
     )
 
 def plcc_loss(y_pred, y):
-    sigma_hat, m_hat = torch.std_mean(y_pred, unbiased=False)
-    y_pred = (y_pred - m_hat) / (sigma_hat + 1e-8)
-    sigma, m = torch.std_mean(y, unbiased=False)
-    y = (y - m) / (sigma + 1e-8)
+    # 先计算方差，加上平滑项后再开方，保证反向传播时梯度安全
+    var_pred, m_hat = torch.var_mean(y_pred, unbiased=False)
+    sigma_hat = torch.sqrt(var_pred + 1e-8)
+    y_pred = (y_pred - m_hat) / sigma_hat
+    
+    var_y, m = torch.var_mean(y, unbiased=False)
+    sigma = torch.sqrt(var_y + 1e-8)
+    y = (y - m) / sigma
+    
     loss0 = torch.nn.functional.mse_loss(y_pred, y) / 4
     rho = torch.mean(y_pred * y)
     loss1 = torch.nn.functional.mse_loss(rho * y_pred, y) / 4
     return ((loss0 + loss1) / 2).float()
 
 def rank_loss(y_pred, y):
+    # 强制转为列向量
+    y_pred = y_pred.view(-1, 1)
+    y = y.view(-1, 1)
+    
     ranking_loss = torch.nn.functional.relu(
         (y_pred - y_pred.t()) * torch.sign((y.t() - y))
     )
@@ -105,6 +114,8 @@ def finetune_epoch(
         loss = p_loss + 0.3 * r_loss
 
         loss.backward()
+        # 【新增】梯度裁剪，防止 Transformer 梯度异常放大
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         scheduler.step()
 
@@ -188,6 +199,7 @@ def inference_set(
         if save_type == "head":
             head_state_dict = OrderedDict()
             for key, v in state_dict.items():
+                # 修改为：
                 if (
                     "finetune" in key
                     or "swin" in key
@@ -195,6 +207,7 @@ def inference_set(
                     or "gate_mixer" in key
                     or "slowfast" in key
                     or "blip.text_encoder" in key
+                    or "lora" in key  # 【新增】这一行，确保视觉编码器的 lora 权重落盘保存
                 ):
                     head_state_dict[key] = v
             print("Following keys are saved (for head-only):", head_state_dict.keys())
