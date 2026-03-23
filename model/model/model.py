@@ -116,7 +116,39 @@ class GateMixer(nn.Module):
         if self.h_p is not None:
             h = torch.cat([self.h_p.expand(h.size(0), -1, -1), h], dim=1)
         return self.w2(h)
-
+class TemporalAdapter(nn.Module):
+    def __init__(self, d_model, num_heads=8, num_layers=2):
+        super().__init__()
+        # 使用 Transformer Encoder 进行帧与帧之间的时序建模
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=num_heads,
+            dim_feedforward=d_model * 4,
+            batch_first=True,
+            norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+    def forward(self, x, B, T):
+        # 输入 x 形状: [B*T, L, C] 
+        _, L, C = x.shape
+        
+        # 形状转换: 划分 Batch 和 Time 维度
+        # [B*T, L, C] -> [B, T, L, C] -> [B, L, T, C] -> [B*L, T, C]
+        # 这样确保对同一个空间位置上的帧序列进行时间上的自注意力计算
+        x = x.view(B, T, L, C).permute(0, 2, 1, 3).reshape(B * L, T, C)
+        
+        # 时序动作特征融合
+        x = self.transformer(x)
+        
+        # 形状转回: [B*L, T, C] -> [B, L, T, C] -> [B, T, L, C]
+        x = x.view(B, L, T, C).permute(0, 2, 1, 3)
+        
+        # 沿时间维度进行平均池化，聚合为全局 Video Token
+        # 最终形状: [B, L, C]
+        video_embeds = x.mean(dim=1) 
+        
+        return video_embeds
 class T2VQA(nn.Module):
     # python的属性字段在init函数声明，self.xx = xx
     def __init__(self,
@@ -151,7 +183,8 @@ class T2VQA(nn.Module):
         # 新增一个纯文本编码器提取语义锚点
         # 加载标准的 bert-base-uncased，默认 add_cross_attention 是 False
         self.pure_text_encoder = BertModel.from_pretrained(args['bert_weights'])
-        
+        vision_width = self.blip.visual_encoder.embed_dim if hasattr(self.blip.visual_encoder, 'embed_dim') else 1024
+        self.temporal_adapter = TemporalAdapter(d_model=vision_width, num_heads=8, num_layers=2)
         # 冻结这个纯文本编码器（视显存情况而定，建议冻结）
         for param in self.pure_text_encoder.parameters():
             param.requires_grad = False
@@ -305,119 +338,90 @@ class T2VQA(nn.Module):
         self.llm_model.load_state_dict(remapped_state, strict=False)
 
     def forward(self, data, caption, prompt):
-        video = data['video']
+        # 接收双分支数据（如果这里被不小心删掉，就会报 NameError）
+        video_fidelity = data['video_fidelity'] 
+        video_semantic = data['video_semantic'] 
 
         # 1. 优先获取全局纯文本特征作为 Semantic Anchor
-        text = self.blip.tokenizer(caption, padding='max_length', truncation=True, max_length=35, return_tensors="pt").to(video.device)
-        
-        # BLIP text_encoder 不传 encoder_hidden_states 时充当纯文本编码器
-        # 使用专门的纯文本编码器提取
-        text_output = self.pure_text_encoder(text.input_ids, attention_mask=text.attention_mask, return_dict=True)
-        global_text_feat = text_output.last_hidden_state[:, 0, :] # [B, text_dim]
+        text_init = self.blip.tokenizer(caption, padding='max_length', truncation=True, max_length=35, return_tensors="pt").to(video_fidelity.device)
+        text_output = self.pure_text_encoder(text_init.input_ids, attention_mask=text_init.attention_mask, return_dict=True)
+        global_text_feat = text_output.last_hidden_state[:, 0, :] 
 
-        # 2. 技术质量特征：用 Cross-Attention Pooling 替代 AvgPool 展平
-        f_swin = self.swin3d(video) # 原始形状: [B, C, T, H, W]
+        # 2. 技术质量特征：喂入高帧率保真度张量
+        f_swin = self.swin3d(video_fidelity) 
         B, C_s, T_s, H_s, W_s = f_swin.shape
-        # 展平为 [B, T*H*W, C] 
         f_swin_flat = f_swin.view(B, C_s, -1).transpose(1, 2) 
-        # 文本引导对齐
-        pooled_swin = self.swin_attn_pool(global_text_feat, f_swin_flat) # [B, embed_dim]
+        pooled_swin = self.swin_attn_pool(global_text_feat, f_swin_flat) 
 
-        f_conv = self.conv3d(video) # 原始形状: [B, C, T, H, W]
+        f_conv = self.conv3d(video_fidelity) 
         B, C_c, T_c, H_c, W_c = f_conv.shape
-        # 展平为 [B, T*H*W, C]
         f_conv_flat = f_conv.view(B, C_c, -1).transpose(1, 2)
-        # 文本引导对齐
-        pooled_conv = self.conv_attn_pool(global_text_feat, f_conv_flat) # [B, embed_dim]
+        pooled_conv = self.conv_attn_pool(global_text_feat, f_conv_flat) 
 
         # 3. 文本条件引导的 GateMixer
-        # inputs_swin 此时包含高度对齐的时空技术质量 tokens
         inputs_swin = self.gate_mixer(pooled_swin, pooled_conv, global_text_feat)
-        
-        # ... 后续保留你原有的多帧语义 Token 提取和 LLM 逻辑不变 ...
-        atts_swin = torch.ones(inputs_swin.size()[:-1], dtype=torch.long).to(video.device)
-
-        inputs_llm = []
-
-        #人类能看懂的句子（caption）转换成模型能处理的数字矩阵（Tokens），并统一所有句子的长度。
-        #将字符串拆分成“词元”（Tokens）。例如把 "A cat is running" 拆解并映射为词表中的索引数字，如 [101, 134, 567, ...]。
-        text = self.blip.tokenizer(caption, padding='max_length', truncation=True, max_length=35, 
-                                  return_tensors="pt").to(video.device)
-        
-        # ---------- 多帧语义 token（逐帧：视觉 encoder + text_encoder cross-attn） ----------
-        # 这个video是数据加载器封装的五个维度的那个
-        for j in range(video.size(2)):#size（2）获取第三个维度的内容
-            #遍历每一帧
-            image = video[:,:,j,:,:]
-
-            image_embeds = self.blip.visual_encoder(image)
-
-            # 给图像 embedding 构造一个 全1的 attention mask
-            image_atts = torch.ones(image_embeds.size()[:-1],dtype=torch.long).to(video.device)
-
-            # 交叉注意力机制
-            output = self.blip.text_encoder(text.input_ids,
-                                                attention_mask = text.attention_mask,
-                                                encoder_hidden_states = image_embeds,
-                                                encoder_attention_mask = image_atts,
-                                                return_dict = True,
-                                            )
-
-            # 取 [CLS] 作为该帧的语义摘要 token
-            output = self.finetune_text_proj(output.last_hidden_state[:,0,:])
-
-
-            inputs_llm.append(output)
-
-        semantic_tokens = torch.stack(inputs_llm, dim=1)
-        semantic_tokens = self.finetune_semantic_proj(semantic_tokens)
         fidelity_tokens = self.finetune_fidelity_proj(inputs_swin)
 
-        inputs_llm = torch.cat([fidelity_tokens, semantic_tokens], dim=1)
-        atts_llm = torch.ones(inputs_llm.size()[:-1], dtype=torch.long).to(video.device)
-
+        # ---------- 新增：时序融合多帧语义 token (改进后) ----------
+        text = self.blip.tokenizer(caption, padding='max_length', truncation=True, max_length=35, return_tensors="pt").to(video_fidelity.device)
         
-        # LLM提示词转换为数字矩阵
-        llm_tokens = self.llm_tokenizer(
-        # ---------- 文本提示词 token（prompt） ----------
-            [prompt] * video.size(0),# 将同一个字符串 prompt 重复B次，组成一个列表。
-            padding="longest",# 自动补长
-            return_tensors="pt"# 返回pt张量
-        ).to(video.device)
+        B_sem, C_v, T_v, H_v, W_v = video_semantic.shape
+        
+        # 1. 维度转换 [B, C, T, H, W] -> [B*T, C, H, W]
+        # 取消 for 循环，并行提取空间特征
+        video_semantic_flat = video_semantic.transpose(1, 2).reshape(B_sem * T_v, C_v, H_v, W_v)
+        frame_embeds = self.blip.visual_encoder(video_semantic_flat) # [B*T, L, C]
+        
+        # 2. 送入时序适配器，获取聚合动作信息的全局 Video Token
+        video_embeds = self.temporal_adapter(frame_embeds, B_sem, T_v) # [B, L, C]
+        video_atts = torch.ones(video_embeds.size()[:-1], dtype=torch.long).to(video_semantic.device)
 
-        # 是否开启混合精度
+        # 3. 与 Text Token 进行一次 Cross-Attention (视频整体与文本交互)
+        output = self.blip.text_encoder(text.input_ids,
+                                        attention_mask=text.attention_mask,
+                                        encoder_hidden_states=video_embeds,
+                                        encoder_attention_mask=video_atts,
+                                        return_dict=True)
+                                        
+        # 4. 提取输出特征并进行投影转换
+        output_feat = self.finetune_text_proj(output.last_hidden_state[:, 0, :]) # [B, embed_dim]
+        
+        # 增加序列维度 [B, 1, embed_dim] 替代原来沿 T 维度 stack 的多帧特征
+        semantic_tokens = output_feat.unsqueeze(1) 
+        
+        # 映射到大语言模型的隐藏层维度
+        semantic_tokens = self.finetune_semantic_proj(semantic_tokens)
+
+        # ---------- 拼接双分支特征喂入 LLM ----------
+        inputs_llm = torch.cat([fidelity_tokens, semantic_tokens], dim=1)
+        atts_llm = torch.ones(inputs_llm.size()[:-1], dtype=torch.long).to(video_fidelity.device)
+
+        llm_tokens = self.llm_tokenizer(
+            [prompt] * video_fidelity.size(0),
+            padding="longest",
+            return_tensors="pt"
+        ).to(video_fidelity.device)
+
         with self.maybe_autocast():
-            # 调用 LLM 自带的嵌入层（Embedding Layer），将之前生成的数字编号（input_ids）映射为高维稠密向量。
             inputs_embeds = self.llm_model.get_input_embeddings()(llm_tokens.input_ids)
-            
-            # 将 Token (inputs_llm) 拼在文本 Token (inputs_embeds) 的前面
             inputs_embeds = torch.cat([inputs_llm.to(dtype=inputs_embeds.dtype), inputs_embeds], dim=1)
-            
-            #同样在序列维度（dim=1）上，将视觉部分的“全 1 掩码”和文本部分的“填充掩码”拼在一起。
             attention_mask = torch.cat([atts_llm, llm_tokens.attention_mask], dim=1)
 
             outputs = self.llm_model(
                     inputs_embeds=inputs_embeds,
                     attention_mask=attention_mask,
-
                 )
-        # 从 LLM 的输出中取 最后一个 Token（即提示词结束后的第一个预测位）的 Logits
+                
         output_logits = outputs.logits[:, -1]
-
-        # 拥有几万个词的概率分布中，精准挑出你最开始获取的那 5 个索引（excellent, good 等）对应的数值。
         lexcellent, lgood, lfair, lpoor, lbad = output_logits[:, self.excellent_idx], output_logits[:, self.good_idx], output_logits[:, self.fair_idx], output_logits[:,self.poor_idx], output_logits[:, self.bad_idx]
 
-        #归一化
-        q_pred = (torch.stack([lexcellent, lgood, lfair, lpoor, lbad]) / 100).softmax(0)
-
-        #加权得分
-        weights = self.weights.expand(-1, q_pred.shape[1]).to(video.device)
+        # 强制将 FP16 的 logits 转换为 FP32 再进行除法和 softmax，防止底层数值溢出
+        q_pred = (torch.stack([lexcellent, lgood, lfair, lpoor, lbad]).float() / 2).softmax(0)
+        weights = self.weights.expand(-1, q_pred.shape[1]).to(video_fidelity.device)
         q_pred = torch.mul(q_pred, weights)
-
         q_pred = torch.sum(q_pred, dim=0)
 
         return q_pred
-
 
 
 
