@@ -80,7 +80,9 @@ def finetune_epoch(
     for i, data in enumerate(tqdm(ft_loader, desc=f"Training in epoch {epoch}")):
         optimizer.zero_grad()
         video = {}
-        video["video"] = data["video"].to(device)
+        # 将同一个视频张量同时喂给 fidelity (保真度) 和 semantic (语义) 两个分支
+        video["video_fidelity"] = data["video"].to(device)
+        video["video_semantic"] = data["video"].to(device)
         video["frame_inds"] = data["frame_inds"].to(device)
 
         y = data["gt_label"].float().detach().to(device)
@@ -133,7 +135,8 @@ def inference_set(
         result = dict()
         video, video_up = {}, {}
 
-        video['video'] = data['video'].to(device)
+        video['video_fidelity'] = data['video'].to(device)
+        video['video_semantic'] = data['video'].to(device)
         
         ## Reshape into clips
         b, c, t, h, w = video['video'].shape
