@@ -1,3 +1,4 @@
+from transformers import CLIPVisionModel, BertTokenizer
 import contextlib
 from transformers import LlamaForCausalLM, LlamaTokenizer, BertModel
 
@@ -130,40 +131,40 @@ class T2VQA(nn.Module):
         embed_dim = args['embed_dim']#不同模态嵌入维度
         llm_model = args['llm_model']
 
-        # ---------- 视觉-文本编码器（BLIP） ----------
-        # 这里用 BLIP 的 text_encoder 读取 caption，并通过 cross-attn 融合每帧的视觉 token
-        self.blip = BLIP_Pretrain(image_size = image_size, vit = 'large', embed_dim = embed_dim, med_config = med_config)
-        # 反序列化python对象，加载 BLIP 预训练权重
-        state_dict = torch.load(args['blip_weights'], map_location='cpu')
 
-        # 将state_dict的内容键张量对加载到模型里面的对应参数，模型有关参数在model键下，False表示不严格匹配
-        self.blip.load_state_dict(state_dict["model"], strict=False)
-
-        for name, param in self.blip.named_parameters():
-            if ("text_encoder" in name):
-                # 是否计算梯度，反向传播是否更新
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
-
-        # 把 BLIP text_encoder 输出投到 embed_dim（后续作为多帧语义 token）
-        self.finetune_text_proj = nn.Linear(self.blip.text_encoder.config.hidden_size, embed_dim)
-        # 新增一个纯文本编码器提取语义锚点
-        # 加载标准的 bert-base-uncased，默认 add_cross_attention 是 False
-        self.pure_text_encoder = BertModel.from_pretrained(args['bert_weights'])
+        clip_version = args.get('clip_weights', "openai/clip-vit-large-patch14")
+        self.clip_vision = CLIPVisionModel.from_pretrained(clip_version)
         
-        # 冻结这个纯文本编码器（视显存情况而定，建议冻结）
+        # 设置 CLIP 是否参与微调 (视显存情况而定)
+        for param in self.clip_vision.parameters():
+            param.requires_grad = False  # 或者设为 False 进行冻结
+
+        
+        
+        self.pure_text_encoder = BertModel.from_pretrained(args['bert_weights'])
+        # 修改后：使用 pure_text_encoder 获取维度
+        self.finetune_text_proj = nn.Linear(self.pure_text_encoder.config.hidden_size, embed_dim)
+       
         for param in self.pure_text_encoder.parameters():
             param.requires_grad = False
+        # 因为移除了 BLIP，需要独立加载一个 BertTokenizer 配合 pure_text_encoder 使用
+        self.text_tokenizer = BertTokenizer.from_pretrained(args['bert_weights'])
+        # ==================== 新增: 逐帧交叉注意力池化器 ====================
+        # 用来替代原先 BLIP 的 text_encoder，将 CLIP 的空间特征与全局文本 Token 融合
+        clip_hidden_size = self.clip_vision.config.hidden_size
+        # 修改后：同样使用 pure_text_encoder 获取文本维度
+        text_hidden_size = self.pure_text_encoder.config.hidden_size
+        self.frame_attn_pool = CrossAttentionPooling(
+            text_dim=text_hidden_size, 
+            visual_dim=clip_hidden_size, 
+            embed_dim=embed_dim
+        )
 
-        # ---------- 语言模型（LLM） ----------
-        # LLM 本体冻结，仅用作“把多模态 token + 文本 prompt”映射到质量词的 logits
         self.llm_tokenizer = LlamaTokenizer.from_pretrained(llm_model, use_fast=False)
         self.llm_model = LlamaForCausalLM.from_pretrained(
             llm_model, torch_dtype=torch.float16
         )
-        # 设置词表
-        # 特殊标记的添加时为了确保LLM可以正确处理输入序列，开始结束和词汇表外的词汇
+    
         self.llm_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
         self.llm_tokenizer.add_special_tokens({'bos_token': '</s>'})
         self.llm_tokenizer.add_special_tokens({'eos_token': '</s>'})
@@ -230,7 +231,7 @@ class T2VQA(nn.Module):
         # self.conv_avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
 
         # 新增交叉注意力池化器 (假设 Swin3D 和 ConvNext3D 输出通道都是 768)
-        text_hidden_size = self.blip.text_encoder.config.hidden_size
+        text_hidden_size = self.pure_text_encoder.config.hidden_size
         self.swin_attn_pool = CrossAttentionPooling(text_dim=text_hidden_size, visual_dim=768, embed_dim=embed_dim)
         self.conv_attn_pool = CrossAttentionPooling(text_dim=text_hidden_size, visual_dim=768, embed_dim=embed_dim)
 
@@ -307,11 +308,8 @@ class T2VQA(nn.Module):
     def forward(self, data, caption, prompt):
         video = data['video']
 
-        # 1. 优先获取全局纯文本特征作为 Semantic Anchor
-        text = self.blip.tokenizer(caption, padding='max_length', truncation=True, max_length=35, return_tensors="pt").to(video.device)
+        text = self.text_tokenizer(caption, padding='max_length', truncation=True, max_length=35, return_tensors="pt").to(video.device)
         
-        # BLIP text_encoder 不传 encoder_hidden_states 时充当纯文本编码器
-        # 使用专门的纯文本编码器提取
         text_output = self.pure_text_encoder(text.input_ids, attention_mask=text.attention_mask, return_dict=True)
         global_text_feat = text_output.last_hidden_state[:, 0, :] # [B, text_dim]
 
@@ -334,40 +332,28 @@ class T2VQA(nn.Module):
         # inputs_swin 此时包含高度对齐的时空技术质量 tokens
         inputs_swin = self.gate_mixer(pooled_swin, pooled_conv, global_text_feat)
         
-        # ... 后续保留你原有的多帧语义 Token 提取和 LLM 逻辑不变 ...
+        
         atts_swin = torch.ones(inputs_swin.size()[:-1], dtype=torch.long).to(video.device)
 
         inputs_llm = []
 
-        #人类能看懂的句子（caption）转换成模型能处理的数字矩阵（Tokens），并统一所有句子的长度。
-        #将字符串拆分成“词元”（Tokens）。例如把 "A cat is running" 拆解并映射为词表中的索引数字，如 [101, 134, 567, ...]。
-        text = self.blip.tokenizer(caption, padding='max_length', truncation=True, max_length=35, 
-                                  return_tensors="pt").to(video.device)
-        
-        # ---------- 多帧语义 token（逐帧：视觉 encoder + text_encoder cross-attn） ----------
-        # 这个video是数据加载器封装的五个维度的那个
-        for j in range(video.size(2)):#size（2）获取第三个维度的内容
-            #遍历每一帧
-            image = video[:,:,j,:,:]
+        # ---------- 新的：多帧语义 token 提取 (基于 CLIP 视觉特征 + Cross Attention) ----------
+        for j in range(video.size(2)):
+            image = video[:,:,j,:,:] # [B, 3, H, W]
 
-            image_embeds = self.blip.visual_encoder(image)
+            # 1. 使用 CLIP 提取逐帧的空间特征 (Spatial Features)
+            # 输出包含 pooler_output 和 last_hidden_state
+            clip_outputs = self.clip_vision(pixel_values=image)
+            
+            # 取出空间 Patch 特征: [B, N, clip_hidden_size]
+            image_embeds = clip_outputs.last_hidden_state 
 
-            # 给图像 embedding 构造一个 全1的 attention mask
-            image_atts = torch.ones(image_embeds.size()[:-1],dtype=torch.long).to(video.device)
+            # 2. 跨模态融合: 使用你定义的 CrossAttentionPooling
+            # 让纯文本的 Semantic Anchor (global_text_feat) 去查询(Query)每一帧的 CLIP 空间特征(Key/Value)
+            # 输出形状: [B, embed_dim]
+            frame_semantic_token = self.frame_attn_pool(global_text_feat, image_embeds)
 
-            # 交叉注意力机制
-            output = self.blip.text_encoder(text.input_ids,
-                                                attention_mask = text.attention_mask,
-                                                encoder_hidden_states = image_embeds,
-                                                encoder_attention_mask = image_atts,
-                                                return_dict = True,
-                                            )
-
-            # 取 [CLS] 作为该帧的语义摘要 token
-            output = self.finetune_text_proj(output.last_hidden_state[:,0,:])
-
-
-            inputs_llm.append(output)
+            inputs_llm.append(frame_semantic_token)
 
         semantic_tokens = torch.stack(inputs_llm, dim=1)
         semantic_tokens = self.finetune_semantic_proj(semantic_tokens)

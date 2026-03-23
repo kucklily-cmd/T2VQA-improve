@@ -53,7 +53,8 @@ model:
         nlayers: 6
         embed_dim: 256 
         llm_model: /root/autodl-tmp/model/vicuna-7b-v1.1
-        blip_weights: /root/autodl-tmp/model/model_large.pth
+        # blip_weights: /root/autodl-tmp/model/model_large.pth
+        clip_weights: "openai/clip-vit-large-patch14"
         swin_weights: /root/autodl-tmp/model/swin_tiny_patch244_window877_kinetics400_1k.pth
         conv_weights: /root/autodl-tmp/model/convnext_3d_tiny_3.pth
         bert_weights: /root/autodl-tmp/model/bert-base-uncased
