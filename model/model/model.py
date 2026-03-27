@@ -202,10 +202,7 @@ class T2VQA(nn.Module):
         
         # 建议在此处 print 一下，确保没有被切碎 (比如长度>1)
         print("Target Token IDs:", self.excellent_idx, self.good_idx, self.fair_idx, self.poor_idx, self.bad_idx)
-        self.good_idx = self.good_idx[1]
-        self.fair_idx = self.fair_idx[1]
-        self.poor_idx = self.poor_idx[1]
-        self.bad_idx = self.bad_idx[1]
+
 
         # ---------- 技术质量分支（Swin3D） ----------
         # 用 3D Swin 从视频 clip 中抽取技术质量/时空结构表征，并扩展成固定长度的 query token（32）

@@ -5,7 +5,7 @@ import random
 import os.path as osp
 import argparse
 from scipy.stats import spearmanr, pearsonr
-from scipy.stats.stats import kendalltau as kendallr
+from scipy.stats import kendalltau as kendallr
 import numpy as np
 from time import time
 from tqdm import tqdm
@@ -87,8 +87,7 @@ def finetune_epoch(
 
         caption = data['prompt']
         
-        prompt = 'Please assess the quality of this video'
-
+        prompt = 'Please assess the quality of this video. Rate it from the following options: excellent, good, fair, poor, bad. The quality is: '
         scores = model(video, caption = caption, prompt = prompt)
 
         y_pred = scores
@@ -139,7 +138,7 @@ def inference_set(
         b, c, t, h, w = video['video'].shape
             
         with torch.no_grad():
-            prompt = 'Please assess the quality of this video'
+            prompt = 'Please assess the quality of this video. Rate it from the following options: excellent, good, fair, poor, bad. The quality is: '
 
             caption = data['prompt']
 
