@@ -1,5 +1,5 @@
 import contextlib
-from transformers import LlamaForCausalLM, LlamaTokenizer, BertModel
+from transformers import AutoModelForCausalLM, AutoTokenizer, BertModel
 
 import torch
 from torch import nn
@@ -156,21 +156,18 @@ class T2VQA(nn.Module):
         for param in self.pure_text_encoder.parameters():
             param.requires_grad = False
 
-        # ---------- 语言模型（LLM） ----------
-        # LLM 本体冻结，仅用作“把多模态 token + 文本 prompt”映射到质量词的 logits
-        self.llm_tokenizer = LlamaTokenizer.from_pretrained(llm_model, use_fast=False)
-        self.llm_model = LlamaForCausalLM.from_pretrained(
-            llm_model, torch_dtype=torch.float16
+       # Qwen 官方推荐使用 fast tokenizer，并且通常需要 trust_remote_code
+        self.llm_tokenizer = AutoTokenizer.from_pretrained(llm_model, use_fast=True, trust_remote_code=True)
+        self.llm_model = AutoModelForCausalLM.from_pretrained(
+            llm_model, torch_dtype=torch.float16, trust_remote_code=True
         )
-        # 设置词表
-        # 特殊标记的添加时为了确保LLM可以正确处理输入序列，开始结束和词汇表外的词汇
-        self.llm_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-        self.llm_tokenizer.add_special_tokens({'bos_token': '</s>'})
-        self.llm_tokenizer.add_special_tokens({'eos_token': '</s>'})
-        self.llm_tokenizer.add_special_tokens({'unk_token': '</s>'})
-
-        #添加新标记的时候同时拓展词嵌入层
-        self.llm_model.resize_token_embeddings(len(self.llm_tokenizer))
+        
+        # Qwen 默认可能没有 pad_token，通常直接将其设置为 eos_token
+        if self.llm_tokenizer.pad_token is None:
+            self.llm_tokenizer.pad_token = self.llm_tokenizer.eos_token
+            
+        # 注意：通常不需要再添加 bos, eos, unk，Qwen 自带完善的特殊符号。
+        # 除非你使用了特殊的 Prompt 模板需要新增，否则尽量不要 resize_token_embeddings，避免破坏预训练权重。
 
         llm_safetensors_index = args.get("llm_safetensors_index", None)
         if llm_safetensors_index:
@@ -188,10 +185,23 @@ class T2VQA(nn.Module):
         self.llm_model = self.llm_model.eval()
         self.llm_model.train = disabled_train
 
-        # 最终从 LLM 的 vocab logits 中取这 5 个词的打分
-        # 词表中五个单词转换为数字列表
-        self.excellent_idx, self.good_idx, self.fair_idx, self.poor_idx, self.bad_idx = self.llm_tokenizer(["excellent", "good","fair", "poor", "bad"])['input_ids']
-        self.excellent_idx = self.excellent_idx[1]
+       # 建议关闭 add_special_tokens，纯粹提取单词本身的 ID
+        target_words = ["excellent", "good", "fair", "poor", "bad"]
+        
+        # 注意：在生成 logits 预测时，Prompt 的结尾通常是 "... quality of this video: "
+        # 在某些分词器中，前置空格会影响 Token 划分。
+        # 但如果是取单个词汇用于打分，直接提取纯单词的第一个 Token ID 即可。
+        encoded_words = self.llm_tokenizer(target_words, add_special_tokens=False)['input_ids']
+        
+        # 取每个单词编码后的第 0 个 ID (Qwen 编码这类常见词通常是一个单 Token)
+        self.excellent_idx = encoded_words[0][0]
+        self.good_idx = encoded_words[1][0]
+        self.fair_idx = encoded_words[2][0]
+        self.poor_idx = encoded_words[3][0]
+        self.bad_idx = encoded_words[4][0]
+        
+        # 建议在此处 print 一下，确保没有被切碎 (比如长度>1)
+        print("Target Token IDs:", self.excellent_idx, self.good_idx, self.fair_idx, self.poor_idx, self.bad_idx)
         self.good_idx = self.good_idx[1]
         self.fair_idx = self.fair_idx[1]
         self.poor_idx = self.poor_idx[1]
