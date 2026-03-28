@@ -18,7 +18,7 @@ from model.conv_backbone import convnext_3d_tiny
 from torch.nn import TransformerDecoderLayer, TransformerDecoder
 from timm.models.vision_transformer import vit_base_patch16_224
 
-
+from peft import LoraConfig, get_peft_model, TaskType
 
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
@@ -146,6 +146,18 @@ class T2VQA(nn.Module):
             else:
                 param.requires_grad = False
 
+        # ====== 新增：为 BLIP 视觉编码器注入 LoRA ======
+        visual_lora_config = LoraConfig(
+            r=16,
+            lora_alpha=32,
+            target_modules=["qkv", "proj", "fc1", "fc2"], # 针对 ViT 的常见线性层名称
+            lora_dropout=0.05,
+            bias="none"
+        )
+        self.blip.visual_encoder = get_peft_model(self.blip.visual_encoder, visual_lora_config)
+        # ===============================================
+
+
         # 把 BLIP text_encoder 输出投到 embed_dim（后续作为多帧语义 token）
         self.finetune_text_proj = nn.Linear(self.blip.text_encoder.config.hidden_size, embed_dim)
         # 新增一个纯文本编码器提取语义锚点
@@ -185,8 +197,21 @@ class T2VQA(nn.Module):
         #保证llm在训练过程中不变化
         for name, param in self.llm_model.named_parameters():#获取里面所有变量（模型参数nn.Parameter）
                 param.requires_grad = False#关闭梯度
-        self.llm_model = self.llm_model.eval()
-        self.llm_model.train = disabled_train
+        # self.llm_model = self.llm_model.eval()
+        # self.llm_model.train = disabled_train
+        # ====== 新增：为 LLM 注入 LoRA ======
+        llm_lora_config = LoraConfig(
+            r=16,
+            lora_alpha=32,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"], # 针对 LLaMA 架构的注意力线性层
+            lora_dropout=0.05,
+            bias="none",
+            task_type="CAUSAL_LM"
+        )
+        self.llm_model = get_peft_model(self.llm_model, llm_lora_config)
+        self.llm_model.train() # 让包含可训练 LoRA 层的模型进入训练状态
+        # ====================================
+
 
         # 最终从 LLM 的 vocab logits 中取这 5 个词的打分
         # 词表中五个单词转换为数字列表

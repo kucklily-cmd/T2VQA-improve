@@ -187,6 +187,7 @@ def inference_set(
                     or "gate_mixer" in key
                     or "slowfast" in key
                     or "blip.text_encoder" in key
+                    or "lora" in key
                 ):
                     head_state_dict[key] = v
             print("Following keys are saved (for head-only):", head_state_dict.keys())
@@ -301,11 +302,9 @@ def main():
                 pin_memory=True,
             )
 
-        # 利用参数组实现部分更新的策略
         param_groups = []   
 
         for name, param in model.named_parameters():
-            
             if (
                 "finetune" in name
                 or "swin" in name
@@ -313,11 +312,12 @@ def main():
                 or "gate_mixer" in name
                 or "slowfast" in name
                 or "blip.text_encoder" in name
+                or "lora" in name  # ====== 新增：捕获 PEFT 注入的 LoRA 参数 ======
             ):
-
-                param_groups += [
-                        {"params": param, "lr": opt["optimizer"]["lr"]}
-                ]
+                if param.requires_grad: # 增加双重保险，只有真正 require_grad 的层才放入优化器
+                    param_groups += [
+                            {"params": param, "lr": opt["optimizer"]["lr"]}
+                    ]
 
 
         optimizer = torch.optim.AdamW(
