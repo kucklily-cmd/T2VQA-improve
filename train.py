@@ -161,13 +161,13 @@ def inference_set(
         if save_type == "head":
             head_state_dict = OrderedDict()
             for key, v in state_dict.items():
-                # 修改：适配重构后的参数名称
                 if (
-                    "semantic_proj" in key
+                    "qformer" in key
                     or "motion_proj" in key
                     or "aesthetic_proj" in key
                     or "slowfast" in key
                     or "aesthetic_conv3d" in key
+                    or "lora" in key # 【新增】：保存模型时带上 LoRA 权重
                 ):
                     head_state_dict[key] = v
             print("Following keys are saved (for head-only):", head_state_dict.keys())
@@ -273,22 +273,22 @@ def main():
                 pin_memory=True,
             )
 
-        # 修改：精确解耦参数组，针对三分支架构
+        # 修改：精确解耦参数组，针对三分支架构 + LoRA
         param_groups = []   
         for name, param in model.named_parameters():
             if (
-                "semantic_proj" in name
+                "qformer" in name
                 or "motion_proj" in name
                 or "aesthetic_proj" in name
                 or "slowfast" in name
                 or "aesthetic_conv3d" in name
+                or "lora" in name # 【新增】：确保 lora 权重参与梯度更新
             ):
                 param.requires_grad = True
                 param_groups += [
                         {"params": param, "lr": opt["optimizer"]["lr"]}
                 ]
             else:
-                # 明确冻结不包含在上述列表中的参数（例如 LLM 和 CLIP）
                 param.requires_grad = False
 
         optimizer = torch.optim.AdamW(
@@ -357,9 +357,9 @@ def main():
             with open(f"training_history_split{split}.json", "w", encoding="utf-8") as f:
                 json.dump(history_log, f, indent=4)
             
-        # 修改：训练结束后如果有需要解锁的操作，必须适配新的模块名称
+        # 修改：训练结束后如果有需要解锁的操作
         for key, value in dict(model.named_children()).items():
-            if "proj" in key or "slowfast" in key or "aesthetic_conv3d" in key:
+            if "proj" in key or "slowfast" in key or "aesthetic_conv3d" in key or "qformer" in key: # 加入 qformer
                 for param in value.parameters():
                     param.requires_grad = True
 

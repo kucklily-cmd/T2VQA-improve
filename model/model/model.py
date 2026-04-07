@@ -4,7 +4,8 @@ from torch import nn
 import torch.nn.functional as F
 from collections import OrderedDict
 import copy
-
+# 1. 在文件开头引入 PEFT
+from peft import LoraConfig, get_peft_model
 # 引入 Qwen 相关的 Auto 类和 CLIP
 from transformers import AutoModelForCausalLM, AutoTokenizer, CLIPVisionModel
 import torchvision.models.video as video_models
@@ -15,37 +16,110 @@ from model.conv_backbone import convnext_3d_tiny
 def disabled_train(self, mode=True):
     """Overwrite model.train with this function to make sure train/eval mode does not change anymore."""
     return self
+class TextConditionedQFormer(nn.Module):
+    def __init__(self, clip_dim=1024, text_dim=3584, embed_dim=768, out_dim=3584, num_queries=8):
+        super().__init__()
+        self.num_queries = num_queries
+        
+        # 1. 降维投影：在高维 (3584) 计算 Attention 显存开销极大，先降至 embed_dim
+        self.video_proj = nn.Linear(clip_dim, embed_dim)
+        self.text_proj = nn.Linear(text_dim, embed_dim)
 
+        # 2. 可学习的 Query Tokens (代表模型自带的视觉信息提取模板)
+        self.query_tokens = nn.Parameter(torch.zeros(1, num_queries, embed_dim))
+        nn.init.normal_(self.query_tokens, std=0.02)
+
+        # 3. 核心交互网络：使用 PyTorch 原生 Transformer Decoder
+        # Query 和 Text 作为 Target (带问题)，Video 作为 Memory (找答案)
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=embed_dim,
+            nhead=8,
+            dim_feedforward=embed_dim * 4,
+            batch_first=True,
+            norm_first=True,  # 推荐使用 norm_first 让训练更稳定
+            activation='gelu'
+        )
+        # 3 层 Decoder 足够完成深度的图文语义对齐
+        self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=3) 
+
+        # 4. 输出投影：升维回 LLM 所需的特征维度
+        self.out_proj = nn.Linear(embed_dim, out_dim)
+
+    def forward(self, video_feats, text_feats, text_mask=None):
+        B = video_feats.size(0)
+
+        # [B, T, embed_dim]
+        v_embeds = self.video_proj(video_feats) 
+        # [B, L, embed_dim]
+        t_embeds = self.text_proj(text_feats)   
+
+        # 扩展 Query Tokens 匹配 batch size
+        queries = self.query_tokens.expand(B, -1, -1) # [B, num_queries, embed_dim]
+
+        # 关键操作：将 Query 和 Text 特征在序列维度拼接作为联合 Target
+        # 这样在 Self-Attention 中 Query 能“看见”文本，再带着文本信息去 Cross-Attend 视频
+        tgt = torch.cat([queries, t_embeds], dim=1) # [B, num_queries + L, embed_dim]
+
+        # 处理文本的 padding mask
+        if text_mask is not None:
+            # Query 部分全 0 (不 mask)
+            query_mask = torch.zeros(B, self.num_queries, dtype=torch.bool, device=tgt.device)
+            # text_mask 是 1 为有效，Transformer 中 True 代表忽略，所以取反
+            t_pad_mask = ~(text_mask.bool()) 
+            tgt_key_padding_mask = torch.cat([query_mask, t_pad_mask], dim=1)
+        else:
+            tgt_key_padding_mask = None
+
+        # 穿越 Transformer 提取特征
+        out = self.transformer(
+            tgt=tgt,
+            memory=v_embeds,
+            tgt_key_padding_mask=tgt_key_padding_mask
+        )
+
+        # 剥离出 Query 部分的输出作为最终的视觉特征 (抛弃附加的文本部分)
+        q_out = out[:, :self.num_queries, :] # [B, num_queries, embed_dim]
+
+        # 升维并返回
+        return self.out_proj(q_out)
 class CustomSlowFast(nn.Module):
     def __init__(self, T_out=8, local_weight_path=None):
         super().__init__()
         
-        # 正确加载 SlowFast 的方式：使用 PyTorch Hub 从 PyTorchVideo 加载
-        # 如果服务器能联网，将 pretrained 改为 True 即可自动下载
-        base = torch.hub.load('facebookresearch/pytorchvideo', 'slowfast_r50', pretrained=False)
+        # 1. 离线加载 base 模型
+        pytorchvideo_dir = '/data/TeamMember/lm/sy/project/models/pytorchvideo-main' 
+        base = torch.hub.load(pytorchvideo_dir, 'slowfast_r50', source='local', pretrained=False)
         
-        # 如果服务器断网，需要手动加载你刚才下载的 .pyth 文件
-        # 例如：local_weight_path = "/data/models/SLOWFAST_8x8_R50.pyth"
         if local_weight_path is not None:
             state_dict = torch.load(local_weight_path, map_location='cpu')
-            # PyTorchVideo 的实际权重被包裹在 'model_state' 键中
             if 'model_state' in state_dict:
                 state_dict = state_dict['model_state']
             base.load_state_dict(state_dict)
             print("Successfully loaded local SlowFast weights.")
             
-        # 移除最后的分类头 (blocks[6] 通常是 ResNetBasicHead)，保留前面的特征提取层
-        self.blocks = nn.ModuleList(list(base.blocks.children())[:-1])
+        # 2. 终极物理隔离：手动且精准地只提取前 5 个特征模块
+        # 彻底抛弃 base.blocks[5]（也就是那个会导致崩溃的固定池化分类头）
+        self.stem = base.blocks[0]
+        self.stage1 = base.blocks[1]
+        self.stage2 = base.blocks[2]
+        self.stage3 = base.blocks[3]
+        self.stage4 = base.blocks[4]
         
-        # Token 平衡：强制将时空特征池化为 T_out 个时序 Token
+        # 3. Token 平衡：强制将时空特征池化为 T_out 个时序 Token
         self.pool = nn.AdaptiveAvgPool3d((T_out, 1, 1))
 
     def forward(self, x):
-        # x 接收一个列表: [slow_pathway, fast_pathway]
-        for block in self.blocks:
-            x = block(x)
-            
-        # x[0] 是慢分支特征 (2048维)，x[1] 是快分支特征 (256维)
+        # 严格按顺序手动前向传播，彻底斩断与分类头的任何联系
+        x = self.stem(x)
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        
+        # 此时 x 完美避开了分类头，输出最纯净的特征: [slow_features, fast_features]
+        # x[0] 是慢分支 (T=2)，x[1] 是快分支 (T=8)
+        
+        # 自适应池化层会自动把 T=2 扩展对齐到 T=8
         slow_pool = self.pool(x[0]) 
         fast_pool = self.pool(x[1]) 
         
@@ -75,12 +149,22 @@ class T2VQA(nn.Module):
         )
         self.llm_model.resize_token_embeddings(len(self.llm_tokenizer))
 
-        # 冻结 LLM 所有参数
+        # 【修改点 1】：冻结原 LLM 参数，但【不要】重写 disabled_train，因为 LoRA 层需要进入 train 模式
         for name, param in self.llm_model.named_parameters():
             param.requires_grad = False
-        self.llm_model = self.llm_model.eval()
-        self.llm_model.train = disabled_train
-
+            
+        # 【新增点 1】：注入 LoRA 适配器
+        peft_config = LoraConfig(
+            task_type="CAUSAL_LM",
+            inference_mode=False,
+            r=16,          # LoRA 的秩，推荐 16 或 32
+            lora_alpha=32,
+            lora_dropout=0.05,
+            # 针对 Qwen 等 LLaMA 架构的推荐 Target Modules
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"] 
+        )
+        self.llm_model = get_peft_model(self.llm_model, peft_config)
+        self.llm_model.print_trainable_parameters() # 打印一下 LoRA 的参数量确认注入成功    
         # 提取 Qwen 的 5 个质量评价词 Token ID（必须带前导空格）
         target_words = [" excellent", " good", " fair", " poor", " bad"]
         word_ids = []
@@ -105,7 +189,15 @@ class T2VQA(nn.Module):
         for param in self.clip.parameters():
             param.requires_grad = False 
             
-        self.semantic_proj = nn.Linear(clip_dim, hidden_size)
+        # 【修改这里】：删除 self.semantic_proj = nn.Linear(...)
+        # 引入定制化 Q-Former，确保输出正好是 T 个 Token
+        self.qformer = TextConditionedQFormer(
+            clip_dim=clip_dim,
+            text_dim=hidden_size,  # Qwen2.5 的 3584 维
+            embed_dim=768,         # 内部计算维度
+            out_dim=hidden_size,   # 输出给 Qwen 的 3584 维
+            num_queries=self.T     # 固定输出 T 个 Token
+        )
 
         # ==========================================================
         # 3. 运动与技术质量分支 (SlowFast-R50)
@@ -148,15 +240,17 @@ class T2VQA(nn.Module):
             return contextlib.nullcontext()
 
     def prepare_slowfast_input(self, video):
-        # 构造 SlowFast 需要的快慢帧输入: [B, C, T, H, W] -> [slow_path, fast_path]
-        # 假设 fast pathway 包含所有帧 (alpha=4 比例)
+        # PyTorchVideo 官方 slowfast_r50 要求的快慢分支比例 (alpha) 严格为 4
+        alpha = 4
+        
+        # Fast pathway: 包含所有的 8 帧
         fast_path = video
-        # Slow pathway 使用下采样帧，通常采样间隔为 4
-        # 为了防止视频过短，使用 ::max(1, T//4) 保证至少能提取帧
-        stride = max(1, video.size(2) // 4)
-        slow_path = video[:, :, ::stride, :, :]
+        
+        # Slow pathway: 严格按照固定步长 alpha 进行降采样
+        # 这样 8 帧的视频会精确抽出 8 / 4 = 2 帧，完美对齐
+        slow_path = video[:, :, ::alpha, :, :]
+        
         return [slow_path, fast_path]
-
     def forward(self, data, caption, prompt):
         # video 形状应当是 [B, 3, T, 224, 224]
         video = data['video']
@@ -178,7 +272,22 @@ class T2VQA(nn.Module):
             
         # 恢复批次和时序维度 [B, T, 1024]
         semantic_tokens = semantic_features.view(B, T, -1) 
-        semantic_embeds = self.semantic_proj(semantic_tokens) # [B, T, 3584]
+        # 【新增】：提取纯 Caption 的文本特征，作为 Q-Former 的条件
+        cap_tokens = self.llm_tokenizer(
+            caption,
+            padding=True,
+            return_tensors="pt"
+        ).to(device)
+
+        with torch.no_grad(): # LLM 是冻结的，这里不需要算梯度
+            cap_embeds = self.llm_model.get_input_embeddings()(cap_tokens.input_ids) # [B, L, 3584]
+
+        # 【修改这里】：不再使用 semantic_proj，而是经过 Q-Former
+        semantic_embeds = self.qformer(
+            video_feats=semantic_tokens, 
+            text_feats=cap_embeds,
+            text_mask=cap_tokens.attention_mask
+        ) # 输出形状保持 [B, T, 3584] 不变
 
         # ==========================================================
         # 2. 运动分支 (SlowFast) - 提取 T 个 Token
@@ -187,8 +296,9 @@ class T2VQA(nn.Module):
         # [B, 2304, T, 1, 1]
         pooled_motion = self.slowfast(sf_input) 
         # [B, T, 2304]
-        motion_tokens = pooled_motion.flatten(3).transpose(1, 2) 
-        motion_embeds = self.motion_proj(motion_tokens) # [B, T, 3584]
+        # 运动分支 (把 flatten(3) 改为 flatten(2))
+        motion_tokens = pooled_motion.flatten(2).transpose(1, 2) 
+        motion_embeds = self.motion_proj(motion_tokens) # 完美形状: [B, T, 3584
 
         # ==========================================================
         # 3. 美学分支 (ConvNeXt) - 提取 T 个 Token
@@ -198,8 +308,9 @@ class T2VQA(nn.Module):
         # [B, 768, T, 1, 1]
         pooled_aes = self.aesthetic_pool(aes_features)
         # [B, T, 768]
-        aesthetic_tokens = pooled_aes.flatten(3).transpose(1, 2) 
-        aesthetic_embeds = self.aesthetic_proj(aesthetic_tokens) # [B, T, 3584]
+        # 美学分支 (把 flatten(3) 改为 flatten(2))
+        aesthetic_tokens = pooled_aes.flatten(2).transpose(1, 2) 
+        aesthetic_embeds = self.aesthetic_proj(aesthetic_tokens) # 完美形状: [B, T, 3584]
 
         # ==========================================================
         # 4. Token 拼接与 Qwen 输入对齐
