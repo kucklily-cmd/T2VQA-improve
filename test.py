@@ -13,7 +13,6 @@ import pickle
 import math
 import yaml
 from collections import OrderedDict
-
 from functools import reduce
 from thop import profile
 import copy
@@ -43,75 +42,12 @@ def train_test_split(dataset_path, ann_file, ratio=0.8, seed=42):
         video_infos[int(ratio * len(video_infos)) :],
     )
 
-def plcc_loss(y_pred, y):
-    sigma_hat, m_hat = torch.std_mean(y_pred, unbiased=False)
-    y_pred = (y_pred - m_hat) / (sigma_hat + 1e-8)
-    sigma, m = torch.std_mean(y, unbiased=False)
-    y = (y - m) / (sigma + 1e-8)
-    loss0 = torch.nn.functional.mse_loss(y_pred, y) / 4
-    rho = torch.mean(y_pred * y)
-    loss1 = torch.nn.functional.mse_loss(rho * y_pred, y) / 4
-    return ((loss0 + loss1) / 2).float()
-
-def rank_loss(y_pred, y):
-    ranking_loss = torch.nn.functional.relu(
-        (y_pred - y_pred.t()) * torch.sign((y.t() - y))
-    )
-    scale = 1 + torch.max(ranking_loss)
-    return (
-        torch.sum(ranking_loss) / y_pred.shape[0] / (y_pred.shape[0] - 1) / scale
-    ).float()
-
 def rescale(pr, gt=None):
-
     if gt is None:
         pr = (pr - np.mean(pr)) / np.std(pr)
     else:
         pr = ((pr - np.mean(pr)) / np.std(pr)) * np.std(gt) + np.mean(gt)
     return pr
-
-def finetune_epoch(
-    ft_loader,
-    model,
-    optimizer,
-    scheduler,
-    device,
-    epoch=-1,
-):
-    model.train()
-    for i, data in enumerate(tqdm(ft_loader, desc=f"Training in epoch {epoch}")):
-        optimizer.zero_grad()
-        video = {}
-        video["video"] = data["video"].to(device)
-        video["frame_inds"] = data["frame_inds"].to(device)
-
-        y = data["gt_label"].float().detach().to(device)
-
-        caption = data['prompt']
-        
-        prompt = 'Please assess the quality of this video'
-
-        scores = model(video, caption = caption, prompt = prompt)
-
-        y_pred = scores
-        # if len(scores) > 1:
-        #     y_pred = reduce(lambda x, y: x + y, scores)
-        # else:
-        #     y_pred = scores[0]
-        # y_pred = y_pred.mean((-3, -2, -1))
-
-        p_loss = plcc_loss(y_pred, y)
-        r_loss = rank_loss(y_pred, y)
-
-        loss = p_loss + 0.3 * r_loss
-
-        loss.backward()
-        optimizer.step()
-        scheduler.step()
-
-        # ft_loader.dataset.refresh_hypers()
-
-    model.eval()
 
 def inference_set(
     inf_loader,
@@ -123,32 +59,32 @@ def inference_set(
     save_name="divide",
     save_type="head",
 ):
-
     results = []
-
     best_s, best_p, best_k, best_r = best_
+
+    # 适配 Qwen 的填空式 Prompt
+    prompt_template = 'Carefully watch the video and evaluate its quality from the aspects of temporal consistency, aesthetic beauty, and semantic alignment. The overall quality of this video is'
 
     for i, data in enumerate(tqdm(inf_loader, desc="Validating")):
         result = dict()
-        video, video_up = {}, {} 
+        inputs, video_up = {}, {} 
 
-        video['video'] = data['video'].to(device)
+        # 适配重构后的模型输入：组装 inputs 字典
+        inputs['video'] = data['video'].to(device)
+        if "video_aesthetic" in data:
+            inputs["video_aesthetic"] = data["video_aesthetic"].to(device)
         
-        ## Reshape into clips
-        b, c, t, h, w = video['video'].shape
-            
         with torch.no_grad():
-            prompt = 'Please assess the quality of this video'
-
             caption = data['prompt']
-
-            result["pr_labels"] = model(video, caption = caption, prompt = prompt).cpu().numpy()
+            
+            # 传入 inputs 字典和新的 prompt_template
+            result["pr_labels"] = model(inputs, caption=caption, prompt=prompt_template).cpu().numpy()
 
             if len(list(video_up.keys())) > 0:
                 result["pr_labels_up"] = model(video_up).cpu().numpy()
 
         result["gt_label"] = data["gt_label"].item()
-        del video, video_up
+        del inputs, video_up
         results.append(result)
 
     ## generate the demo video for video quality localization
@@ -156,25 +92,12 @@ def inference_set(
     pr_labels = [np.mean(r["pr_labels"]) for r in results]
     pr_labels = rescale(pr_labels, gt_labels)
 
-    # with open('result_1.txt', 'a') as f:
-    #     for p in pr_labels:
-    #         f.write(str(p)+'\n')
-
     s = spearmanr(gt_labels, pr_labels)[0]
     p = pearsonr(gt_labels, pr_labels)[0]
     k = kendallr(gt_labels, pr_labels)[0]
     r = np.sqrt(((gt_labels - pr_labels) ** 2).mean())
 
-    # wandb.log(
-    #     {
-    #         f"val_{suffix}/SRCC-{suffix}": s,
-    #         f"val_{suffix}/PLCC-{suffix}": p,
-    #         f"val_{suffix}/KRCC-{suffix}": k,
-    #         f"val_{suffix}/RMSE-{suffix}": r,
-    #     }
-    # )
-
-    del results, result  # , video, video_up
+    del results, result 
     torch.cuda.empty_cache()
 
     if s + p > best_s + best_p and save_model:
@@ -183,7 +106,14 @@ def inference_set(
         if save_type == "head":
             head_state_dict = OrderedDict()
             for key, v in state_dict.items():
-                if "finetune" in key or "swin" in key or "slowfast" in key or 'blip.text_encoder' in key:
+                # 适配新架构的参数名
+                if (
+                    "semantic_proj" in key 
+                    or "motion_proj" in key 
+                    or "aesthetic_proj" in key 
+                    or "slowfast" in key 
+                    or "aesthetic_conv3d" in key
+                ):
                     head_state_dict[key] = v
             print("Following keys are saved (for head-only):", head_state_dict.keys())
             torch.save(
@@ -203,7 +133,6 @@ def inference_set(
         min(best_r, r),
     )
 
-
     print(
         f"For {len(inf_loader)} videos, \nthe accuracy of the model: [{suffix}] is as follows:\n  SROCC: {s:.4f} best: {best_s:.4f} \n  PLCC:  {p:.4f} best: {best_p:.4f}  \n  KROCC: {k:.4f} best: {best_k:.4f} \n  RMSE:  {r:.4f} best: {best_r:.4f}."
     )
@@ -211,7 +140,6 @@ def inference_set(
     return best_s, best_p, best_k, best_r
 
 def main():
-
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "-o", "--opt", type=str, default="t2vqa.yml", help="the option file"
@@ -226,14 +154,11 @@ def main():
         opt = yaml.safe_load(f)
     print(opt)
 
-    ## adaptively choose the device
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    ## defining model and loading checkpoint
 
     bests_ = []
 
+    # 初始化重构后的模型
     model = T2VQA(opt["model"]["args"]).to(device)
 
     try:
@@ -243,14 +168,16 @@ def main():
 
     state_dict = ckpt['state_dict'] if isinstance(ckpt, dict) and 'state_dict' in ckpt else ckpt
 
-    # 移除旧的 Q-Former 相关权重
-    keys_to_remove = [k for k in state_dict.keys() if "finetune_Qformer" in k]
+    # 清理旧架构残留权重（可选，防止不匹配报错）
+    keys_to_remove = [k for k in state_dict.keys() if "finetune_Qformer" in k or "blip" in k or "swin" in k or "gate_mixer" in k]
     for k in keys_to_remove:
-        del state_dict[k]
+        if k in state_dict:
+            del state_dict[k]
         
     msg = model.load_state_dict(state_dict, strict=False)
     print(f"Loaded weights with msg: {msg}")
     model.eval()
+
     if opt.get("split_seed", -1) > 0:
         opt["data"]["train"] = copy.deepcopy(opt["data"][args.target_set])
         opt["data"]["eval"] = copy.deepcopy(opt["data"][args.target_set])

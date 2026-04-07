@@ -1,446 +1,278 @@
 import contextlib
-from transformers import LlamaForCausalLM, LlamaTokenizer, BertModel
-
 import torch
 from torch import nn
 import torch.nn.functional as F
 from collections import OrderedDict
-
 import copy
 
-#from model.attention import Transformer3DModel
-from model.blip import create_vit, init_tokenizer, load_checkpoint
-from model.blip_pretrain import BLIP_Pretrain
-from model.swin import swin_3d_tiny, SwinTransformer3D, SwinTransformer2D
+# 引入 Qwen 相关的 Auto 类和 CLIP
+from transformers import AutoModelForCausalLM, AutoTokenizer, CLIPVisionModel
+import torchvision.models.video as video_models
+
+# 保留你原有的 ConvNeXt3D 导入
 from model.conv_backbone import convnext_3d_tiny
 
-
-from torch.nn import TransformerDecoderLayer, TransformerDecoder
-from timm.models.vision_transformer import vit_base_patch16_224
-
-
-
-def _get_clones(module, N):
-    return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
-
-def zero_module(module):
-    for p in module.parameters():
-        p.detach().zero_()
-    return module
-
-
-
 def disabled_train(self, mode=True):
-    """Overwrite model.train with this function to make sure train/eval mode
-    does not change anymore."""
+    """Overwrite model.train with this function to make sure train/eval mode does not change anymore."""
     return self
 
-class CrossAttentionPooling(nn.Module):
-    def __init__(self, text_dim, visual_dim, embed_dim, num_heads=8):
+class CustomSlowFast(nn.Module):
+    def __init__(self, T_out=8, local_weight_path=None):
         super().__init__()
-        # 将文本特征投影为 Query
-        self.q_proj = nn.Linear(text_dim, embed_dim)
-        # 将视觉时空 Token 投影为 Key 和 Value
-        self.k_proj = nn.Linear(visual_dim, embed_dim)
-        self.v_proj = nn.Linear(visual_dim, embed_dim)
         
-        self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-        self.norm1 = nn.LayerNorm(embed_dim)
+        # 正确加载 SlowFast 的方式：使用 PyTorch Hub 从 PyTorchVideo 加载
+        # 如果服务器能联网，将 pretrained 改为 True 即可自动下载
+        base = torch.hub.load('facebookresearch/pytorchvideo', 'slowfast_r50', pretrained=False)
         
-        # 前馈网络 (FFN) 增加非线性表达能力
-        self.ffn = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim * 4),
-            nn.GELU(),
-            nn.Linear(embed_dim * 4, embed_dim)
-        )
-        self.norm2 = nn.LayerNorm(embed_dim)
+        # 如果服务器断网，需要手动加载你刚才下载的 .pyth 文件
+        # 例如：local_weight_path = "/data/models/SLOWFAST_8x8_R50.pyth"
+        if local_weight_path is not None:
+            state_dict = torch.load(local_weight_path, map_location='cpu')
+            # PyTorchVideo 的实际权重被包裹在 'model_state' 键中
+            if 'model_state' in state_dict:
+                state_dict = state_dict['model_state']
+            base.load_state_dict(state_dict)
+            print("Successfully loaded local SlowFast weights.")
+            
+        # 移除最后的分类头 (blocks[6] 通常是 ResNetBasicHead)，保留前面的特征提取层
+        self.blocks = nn.ModuleList(list(base.blocks.children())[:-1])
+        
+        # Token 平衡：强制将时空特征池化为 T_out 个时序 Token
+        self.pool = nn.AdaptiveAvgPool3d((T_out, 1, 1))
 
-    def forward(self, text_feat, visual_tokens):
-        """
-        text_feat: [B, text_dim] (Semantic Anchor)
-        visual_tokens: [B, T*H*W, visual_dim] (Unpooled 3D features)
-        """
-        # [B, text_dim] -> [B, 1, embed_dim]
-        q = self.q_proj(text_feat).unsqueeze(1) 
-        # [B, T*H*W, visual_dim] -> [B, T*H*W, embed_dim]
-        k = self.k_proj(visual_tokens)
-        v = self.v_proj(visual_tokens)
+    def forward(self, x):
+        # x 接收一个列表: [slow_pathway, fast_pathway]
+        for block in self.blocks:
+            x = block(x)
+            
+        # x[0] 是慢分支特征 (2048维)，x[1] 是快分支特征 (256维)
+        slow_pool = self.pool(x[0]) 
+        fast_pool = self.pool(x[1]) 
         
-        # 交叉注意力计算
-        attn_out, _ = self.attn(q, k, v)  # 输出形状: [B, 1, embed_dim]
-        
-        # 残差连接与归一化
-        out = self.norm1(q + attn_out)
-        ffn_out = self.ffn(out)
-        out = self.norm2(out + ffn_out)
-        
-        # 去掉序列维度，返回池化后的对齐特征: [B, embed_dim]
-        return out.squeeze(1)
-class GateMixer(nn.Module):
-    def __init__(
-        self,
-        v_in_dim,
-        c_in_dim,
-        text_dim,  # 新增文本特征维度
-        d,
-        token_len=32,
-        prefix_len=8,
-        out_dim=None,
-    ):
-        super().__init__()
-        self.token_len = token_len
-        self.prefix_len = prefix_len
-        self.w1_v = nn.Linear(v_in_dim, d)
-        self.w1_c = nn.Linear(c_in_dim, d)
-        # 门控全连接层现在接收：Swin特征(d) + Conv特征(d) + 文本特征(text_dim)
-        self.w_g = nn.Linear(2 * d + text_dim, d) 
-        
-        if prefix_len > 0:
-            self.h_p = nn.Parameter(torch.zeros(1, prefix_len, d))
-            nn.init.normal_(self.h_p, mean=0.0, std=0.02)
-        else:
-            self.h_p = None
-        self.w2 = nn.Linear(d, out_dim or d)
-
-    def forward(self, v_v, v_c, text_feat):
-        h_v = self.w1_v(v_v).unsqueeze(1).expand(-1, self.token_len, -1)
-        h_c = self.w1_c(v_c).unsqueeze(1).expand(-1, self.token_len, -1)
-        
-        # 将文本特征也扩展到序列长度参与门控计算
-        text_feat_exp = text_feat.unsqueeze(1).expand(-1, self.token_len, -1)
-        
-        # 模型现在可以根据 Prompt 决定倾向于全局结构还是局部纹理
-        alpha_v = torch.sigmoid(self.w_g(torch.cat([h_v, h_c, text_feat_exp], dim=-1)))
-        h = (1 - alpha_v) * h_v + alpha_v * h_c
-        
-        if self.h_p is not None:
-            h = torch.cat([self.h_p.expand(h.size(0), -1, -1), h], dim=1)
-        return self.w2(h)
+        # 拼接快慢分支特征，总维度恢复到 2304
+        return torch.cat([slow_pool, fast_pool], dim=1)
 
 class T2VQA(nn.Module):
-    # python的属性字段在init函数声明，self.xx = xx
-    def __init__(self,
-                 args):
+    def __init__(self, args):
         super().__init__()
     
         # ---------- 基础配置 ----------
-        # 读取配置参数
-        med_config = args['med_config']
-        image_size = args['image_size']
-        embed_dim = args['embed_dim']#不同模态嵌入维度
+        self.T = args.get('clip_len', 8)  # 视频帧数/Token 数量基准
         llm_model = args['llm_model']
 
-        # ---------- 视觉-文本编码器（BLIP） ----------
-        # 这里用 BLIP 的 text_encoder 读取 caption，并通过 cross-attn 融合每帧的视觉 token
-        self.blip = BLIP_Pretrain(image_size = image_size, vit = 'large', embed_dim = embed_dim, med_config = med_config)
-        # 反序列化python对象，加载 BLIP 预训练权重
-        state_dict = torch.load(args['blip_weights'], map_location='cpu')
+        # ==========================================================
+        # 1. 语言模型（LLM）: Qwen2.5-7B
+        # ==========================================================
+        self.llm_tokenizer = AutoTokenizer.from_pretrained(llm_model, trust_remote_code=True)
+        if self.llm_tokenizer.pad_token is None:
+            self.llm_tokenizer.pad_token = self.llm_tokenizer.eos_token
 
-        # 将state_dict的内容键张量对加载到模型里面的对应参数，模型有关参数在model键下，False表示不严格匹配
-        self.blip.load_state_dict(state_dict["model"], strict=False)
-
-        for name, param in self.blip.named_parameters():
-            if ("text_encoder" in name):
-                # 是否计算梯度，反向传播是否更新
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
-
-        # 把 BLIP text_encoder 输出投到 embed_dim（后续作为多帧语义 token）
-        self.finetune_text_proj = nn.Linear(self.blip.text_encoder.config.hidden_size, embed_dim)
-        # 新增一个纯文本编码器提取语义锚点
-        # 加载标准的 bert-base-uncased，默认 add_cross_attention 是 False
-        self.pure_text_encoder = BertModel.from_pretrained(args['bert_weights'])
-        
-        # 冻结这个纯文本编码器（视显存情况而定，建议冻结）
-        for param in self.pure_text_encoder.parameters():
-            param.requires_grad = False
-
-        # ---------- 语言模型（LLM） ----------
-        # LLM 本体冻结，仅用作“把多模态 token + 文本 prompt”映射到质量词的 logits
-        self.llm_tokenizer = LlamaTokenizer.from_pretrained(llm_model, use_fast=False)
-        self.llm_model = LlamaForCausalLM.from_pretrained(
-            llm_model, torch_dtype=torch.float16
+        # 推荐使用 bfloat16 加载 Qwen，如果显卡支持，可以开启 flash_attention_2
+        self.llm_model = AutoModelForCausalLM.from_pretrained(
+            llm_model, 
+            torch_dtype=torch.bfloat16, 
+            trust_remote_code=True
         )
-        # 设置词表
-        # 特殊标记的添加时为了确保LLM可以正确处理输入序列，开始结束和词汇表外的词汇
-        self.llm_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-        self.llm_tokenizer.add_special_tokens({'bos_token': '</s>'})
-        self.llm_tokenizer.add_special_tokens({'eos_token': '</s>'})
-        self.llm_tokenizer.add_special_tokens({'unk_token': '</s>'})
-
-        #添加新标记的时候同时拓展词嵌入层
         self.llm_model.resize_token_embeddings(len(self.llm_tokenizer))
 
-        llm_safetensors_index = args.get("llm_safetensors_index", None)
-        if llm_safetensors_index:
-            self._load_llm_from_safetensors_index(
-                llm_safetensors_index,
-                prefix_to_strip=args.get("llm_safetensors_prefix_to_strip", "llm."),
-            )
-
-        self.finetune_semantic_proj = nn.Linear(embed_dim, self.llm_model.config.hidden_size)
-        self.finetune_fidelity_proj = nn.Linear(embed_dim, self.llm_model.config.hidden_size)
-        
-        #保证llm在训练过程中不变化
-        for name, param in self.llm_model.named_parameters():#获取里面所有变量（模型参数nn.Parameter）
-                param.requires_grad = False#关闭梯度
+        # 冻结 LLM 所有参数
+        for name, param in self.llm_model.named_parameters():
+            param.requires_grad = False
         self.llm_model = self.llm_model.eval()
         self.llm_model.train = disabled_train
 
-        # 最终从 LLM 的 vocab logits 中取这 5 个词的打分
-        # 词表中五个单词转换为数字列表
-        self.excellent_idx, self.good_idx, self.fair_idx, self.poor_idx, self.bad_idx = self.llm_tokenizer(["excellent", "good","fair", "poor", "bad"])['input_ids']
-        self.excellent_idx = self.excellent_idx[1]
-        self.good_idx = self.good_idx[1]
-        self.fair_idx = self.fair_idx[1]
-        self.poor_idx = self.poor_idx[1]
-        self.bad_idx = self.bad_idx[1]
-
-        # ---------- 技术质量分支（Swin3D） ----------
-        # 用 3D Swin 从视频 clip 中抽取技术质量/时空结构表征，并扩展成固定长度的 query token（32）
-        self.swin3d = swin_3d_tiny()
-        state_dict = torch.load(args['swin_weights'], map_location='cpu')
-        state_dict = state_dict['state_dict']
-        
-        #我的状态字典，有序状态字典
-        # 传入状态字典可以和我的模型名字对齐
-        i_state_dict = OrderedDict()
-        for key in state_dict.keys():
-            if "head" in key:
-                continue
-            if "cls" in key:
-                tkey = key.replace("cls", "vqa")
-            elif "backbone" in key:
-                tkey = key.replace("backbone.", "")
-                i_state_dict[tkey] = state_dict[key]
-            else:
-                i_state_dict[key] = state_dict[key]
+        # 提取 Qwen 的 5 个质量评价词 Token ID（必须带前导空格）
+        target_words = [" excellent", " good", " fair", " poor", " bad"]
+        word_ids = []
+        for word in target_words:
+            tokens = self.llm_tokenizer(word, add_special_tokens=False)['input_ids']
+            word_ids.append(tokens[0])
             
-        print(self.swin3d.load_state_dict(i_state_dict, strict=False))
-        
-        #自适应平均池化，指定输出的尺寸
-        # self.swin_avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        self.excellent_idx, self.good_idx, self.fair_idx, self.poor_idx, self.bad_idx = word_ids
+        self.weights = torch.Tensor([[1], [2], [3], [4], [5]])
 
-        self.conv3d = convnext_3d_tiny(
-            pretrained=args.get("conv_pretrained", False),
-            in_22k=args.get("conv_in_22k", False),
-            checkpoint=args.get("conv_weights", None),
+        # LLM 的隐藏层维度 (Qwen2.5-7B 通常为 3584)
+        hidden_size = self.llm_model.config.hidden_size
+
+        # ==========================================================
+        # 2. 空间语义分支 (CLIP)
+        # ==========================================================
+        clip_weights = args.get('clip_weights', 'openai/clip-vit-large-patch14')
+        self.clip = CLIPVisionModel.from_pretrained(clip_weights)
+        clip_dim = self.clip.config.hidden_size # ViT-Large 为 1024
+        
+        # 冻结 CLIP 参数
+        for param in self.clip.parameters():
+            param.requires_grad = False 
+            
+        self.semantic_proj = nn.Linear(clip_dim, hidden_size)
+
+        # ==========================================================
+        # 3. 运动与技术质量分支 (SlowFast-R50)
+        # ==========================================================
+        # 传入你本地下载好的 .pyth 文件绝对路径
+        # 如果你已经搞定了服务器联网，直接让它留空 (local_weight_path=None) 并在上面设 pretrained=True 即可
+        self.slowfast = CustomSlowFast(
+            T_out=self.T, 
+            local_weight_path='/data/TeamMember/lm/sy/project/models/models/SLOWFAST_8x8_R50.pyth' 
         )
-        # self.conv_avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        slowfast_dim = 2304 
+        
+        # 视显存情况，可以微调 SlowFast，或者在此处冻结
+        # for param in self.slowfast.parameters(): param.requires_grad = False
+        
+        self.motion_proj = nn.Linear(slowfast_dim, hidden_size)
+
         # ==========================================================
-        # 新增：---------- 美学质量分支（Aesthetic Branch） ----------
+        # 4. 美学质量分支 (ConvNeXt3D)
         # ==========================================================
-        # 1. 引入专门用于美学的 ConvNeXt3D，加载 Dover/Cover 预训练权重
         self.aesthetic_conv3d = convnext_3d_tiny(
             pretrained=args.get("conv_pretrained", False),
             in_22k=args.get("conv_in_22k", False),
-            checkpoint=args.get("aesthetic_weights", None), # 需要在 yml 中配置该路径
+            checkpoint=args.get("aesthetic_weights", None), 
         )
+        convnext_dim = 768
+        # Token 平衡：强制将时空特征池化为 T 个时序 Token
+        self.aesthetic_pool = nn.AdaptiveAvgPool3d((self.T, 1, 1))
         
-        # 2. 全局池化层，将时空特征压缩为 1 个 Token
-        self.aesthetic_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
-        
-        # 3. 维度适配投影：ConvNeXt_tiny 输出是 768 维，将其投影到 LLM 的 hidden_size 维度
-        self.finetune_aesthetic_proj = nn.Linear(768, self.llm_model.config.hidden_size)
-        # ==========================================================
-        # 新增交叉注意力池化器 (假设 Swin3D 和 ConvNext3D 输出通道都是 768)
-        text_hidden_size = self.blip.text_encoder.config.hidden_size
-        self.swin_attn_pool = CrossAttentionPooling(text_dim=text_hidden_size, visual_dim=768, embed_dim=embed_dim)
-        self.conv_attn_pool = CrossAttentionPooling(text_dim=text_hidden_size, visual_dim=768, embed_dim=embed_dim)
-
-        self.gate_mixer = GateMixer(
-            v_in_dim=embed_dim,    # 注意这里改为了 embed_dim，因为 attn_pool 输出是 embed_dim
-            c_in_dim=embed_dim,    
-            text_dim=text_hidden_size, # 传入文本维度
-            d=embed_dim,
-            token_len=args.get("gatemixer_token_len", 32),
-            prefix_len=args.get("gatemixer_prefix_len", 8),
-            out_dim=embed_dim,
-        )
-
-        # 将 5 个等级映射到数值权重（1~5），用于把 5 个词的概率加权成最终分数
-        self.weights = torch.Tensor([[1], [2], [3], [4], [5]])
-
-
-    def quality_regression(self,in_channels, middle_channels, out_channels):
-        regression_block = nn.Sequential(
-            nn.Linear(in_channels, middle_channels),
-            nn.Linear(middle_channels, out_channels),          
-        )
-
-        return regression_block
-
+        self.aesthetic_proj = nn.Linear(convnext_dim, hidden_size)
 
     def device(self):
         return list(self.parameters())[0].device
 
-    def maybe_autocast(self, dtype=torch.float16):
-        # if on cpu, don't use autocast
-        # if on gpu, use autocast with dtype if provided, otherwise use torch.float16
-        enable_autocast = self.device != torch.device("cpu")
-
+    def maybe_autocast(self, dtype=torch.bfloat16):
+        enable_autocast = self.device() != torch.device("cpu")
         if enable_autocast:
             return torch.cuda.amp.autocast(dtype=dtype)
         else:
             return contextlib.nullcontext()
 
-    def _load_llm_from_safetensors_index(self, index_json_path: str, prefix_to_strip: str = "llm."):
-        import json
-        import os
-
-        try:
-            from safetensors.torch import load_file
-        except Exception as e:
-            raise ModuleNotFoundError(
-                "Missing dependency `safetensors`. Install it to load *.safetensors shards."
-            ) from e
-
-        with open(index_json_path, "r", encoding="utf-8") as f:
-            index = json.load(f)
-        weight_map = index.get("weight_map", {})
-        shard_to_keys = {}
-        for k, shard_name in weight_map.items():
-            if prefix_to_strip and not k.startswith(prefix_to_strip):
-                continue
-            shard_to_keys.setdefault(shard_name, []).append(k)
-
-        base_dir = os.path.dirname(index_json_path)
-        remapped_state = {}
-        for shard_name, keys in shard_to_keys.items():
-            shard_path = os.path.join(base_dir, shard_name)
-            if not os.path.exists(shard_path):
-                raise FileNotFoundError(f"Missing shard file: {shard_path}")
-            shard_state = load_file(shard_path, device="cpu")
-            for k in keys:
-                new_k = k[len(prefix_to_strip):] if prefix_to_strip else k
-                if k in shard_state:
-                    remapped_state[new_k] = shard_state[k]
-
-        self.llm_model.load_state_dict(remapped_state, strict=False)
+    def prepare_slowfast_input(self, video):
+        # 构造 SlowFast 需要的快慢帧输入: [B, C, T, H, W] -> [slow_path, fast_path]
+        # 假设 fast pathway 包含所有帧 (alpha=4 比例)
+        fast_path = video
+        # Slow pathway 使用下采样帧，通常采样间隔为 4
+        # 为了防止视频过短，使用 ::max(1, T//4) 保证至少能提取帧
+        stride = max(1, video.size(2) // 4)
+        slow_path = video[:, :, ::stride, :, :]
+        return [slow_path, fast_path]
 
     def forward(self, data, caption, prompt):
-        # 1. 统一只获取 'video'，因为目前 dataset.py 里只有这个
+        # video 形状应当是 [B, 3, T, 224, 224]
         video = data['video']
+        B, C, T, H, W = video.shape
+        device = video.device
 
-        # 新增：接收美学分支的数据。如果 DataLoader 提供了独立的 video_aesthetic 就用它，
-        # 如果没有提供（目前是没有的），就默认复用基础的 video 数据
+        # 如果 DataLoader 提供了独立美学数据则用，否则复用基础数据
         video_aesthetic = data.get('video_aesthetic', video)
 
-
-        # 1. 优先获取全局纯文本特征作为 Semantic Anchor
-        text = self.blip.tokenizer(caption, padding='max_length', truncation=True, max_length=35, return_tensors="pt").to(video.device)
-        
-        # BLIP text_encoder 不传 encoder_hidden_states 时充当纯文本编码器
-        # 使用专门的纯文本编码器提取
-        text_output = self.pure_text_encoder(text.input_ids, attention_mask=text.attention_mask, return_dict=True)
-        global_text_feat = text_output.last_hidden_state[:, 0, :] # [B, text_dim]
-
-        # 2. 技术质量特征：用 Cross-Attention Pooling 替代 AvgPool 展平
-        f_swin = self.swin3d(video) # 原始形状: [B, C, T, H, W]
-        B, C_s, T_s, H_s, W_s = f_swin.shape
-        # 展平为 [B, T*H*W, C] 
-        f_swin_flat = f_swin.view(B, C_s, -1).transpose(1, 2) 
-        # 文本引导对齐
-        pooled_swin = self.swin_attn_pool(global_text_feat, f_swin_flat) # [B, embed_dim]
-
-        f_conv = self.conv3d(video) # 原始形状: [B, C, T, H, W]
-        B, C_c, T_c, H_c, W_c = f_conv.shape
-        # 展平为 [B, T*H*W, C]
-        f_conv_flat = f_conv.view(B, C_c, -1).transpose(1, 2)
-        # 文本引导对齐
-        pooled_conv = self.conv_attn_pool(global_text_feat, f_conv_flat) # [B, embed_dim]
-
-        # 3. 文本条件引导的 GateMixer
-        # inputs_swin 此时包含高度对齐的时空技术质量 tokens
-        inputs_swin = self.gate_mixer(pooled_swin, pooled_conv, global_text_feat)
-
-        # ... 后续保留你原有的多帧语义 Token 提取和 LLM 逻辑不变 ...
-        atts_swin =  torch.ones(inputs_swin.size()[:-1], dtype=torch.long).to(video.device)
-        
         # ==========================================================
-        # 新增：---------- 提取美学分支特征 ----------
+        # 1. 空间语义分支 (CLIP) - 提取 T 个 Token
         # ==========================================================
-        # f_aes shape: [B, 768, T', H', W']
-        f_aes = self.aesthetic_conv3d(video_aesthetic)  # 这里使用的是 video_aesthetic
-        # 全局池化并展平: [B, 768, 1, 1, 1] -> [B, 768]
-        pooled_aes = self.aesthetic_pool(f_aes).flatten(1)
-        # 维度映射到 LLM hidden_size，并增加序列维度: [B, 768] -> [B, 1, hidden_size]
-        aesthetic_tokens = self.finetune_aesthetic_proj(pooled_aes).unsqueeze(1)
-        # ==========================================================
-        
-        inputs_llm = []
-
-        #人类能看懂的句子（caption）转换成模型能处理的数字矩阵（Tokens），并统一所有句子的长度。
-        text = self.blip.tokenizer(caption, padding='max_length', truncation=True, max_length=35, 
-                                  return_tensors="pt").to(video.device)
-        
-        # ---------- 多帧语义 token（逐帧：视觉 encoder + text_encoder cross-attn） ----------
-        for j in range(video.size(2)):
-            image = video[:,:,j,:,:]
-            image_embeds = self.blip.visual_encoder(image)
-            image_atts = torch.ones(image_embeds.size()[:-1],dtype=torch.long).to(video.device)
-            output = self.blip.text_encoder(text.input_ids,
-                                                attention_mask = text.attention_mask,
-                                                encoder_hidden_states = image_embeds,
-                                                encoder_attention_mask = image_atts,
-                                                return_dict = True,
-                                            )
-            output = self.finetune_text_proj(output.last_hidden_state[:,0,:])
-            inputs_llm.append(output)
-
-        semantic_tokens = torch.stack(inputs_llm, dim=1)
-        semantic_tokens = self.finetune_semantic_proj(semantic_tokens)
-        fidelity_tokens = self.finetune_fidelity_proj(inputs_swin)
+        # 将视频折叠为 [B*T, 3, H, W] 逐帧输入 CLIP
+        frames = video.transpose(1, 2).reshape(B * T, C, H, W)
+        with torch.no_grad():
+            clip_outputs = self.clip(pixel_values=frames)
+            # 使用全局 [CLS] token 表征整帧的语义 [B*T, 1024]
+            semantic_features = clip_outputs.pooler_output 
+            
+        # 恢复批次和时序维度 [B, T, 1024]
+        semantic_tokens = semantic_features.view(B, T, -1) 
+        semantic_embeds = self.semantic_proj(semantic_tokens) # [B, T, 3584]
 
         # ==========================================================
-        # 修改：---------- 多分支特征拼接 ----------
+        # 2. 运动分支 (SlowFast) - 提取 T 个 Token
         # ==========================================================
-        inputs_llm = torch.cat([fidelity_tokens, aesthetic_tokens, semantic_tokens], dim=1)
-        
-        # 注意这里：之前你写的是 to(video_fidelity.device)，现在统一改成 to(video.device)
-        atts_llm = torch.ones(inputs_llm.size()[:-1], dtype=torch.long).to(video.device)
+        sf_input = self.prepare_slowfast_input(video)
+        # [B, 2304, T, 1, 1]
+        pooled_motion = self.slowfast(sf_input) 
+        # [B, T, 2304]
+        motion_tokens = pooled_motion.flatten(3).transpose(1, 2) 
+        motion_embeds = self.motion_proj(motion_tokens) # [B, T, 3584]
+
+        # ==========================================================
+        # 3. 美学分支 (ConvNeXt) - 提取 T 个 Token
+        # ==========================================================
+        # [B, 768, T', H', W']
+        aes_features = self.aesthetic_conv3d(video_aesthetic) 
+        # [B, 768, T, 1, 1]
+        pooled_aes = self.aesthetic_pool(aes_features)
+        # [B, T, 768]
+        aesthetic_tokens = pooled_aes.flatten(3).transpose(1, 2) 
+        aesthetic_embeds = self.aesthetic_proj(aesthetic_tokens) # [B, T, 3584]
+
+        # ==========================================================
+        # 4. Token 拼接与 Qwen 输入对齐
+        # ==========================================================
+        # 序列维度拼接，实现 3*T 的 Token 绝对平衡
+        # 形状变为 [B, 3*T, 3584]
+        multimodal_embeds = torch.cat([motion_embeds, aesthetic_embeds, semantic_embeds], dim=1) 
+        atts_multimodal = torch.ones(multimodal_embeds.size()[:-1], dtype=torch.long).to(device)
+
+        # 我们可以将传入的 caption 作为背景信息融合到 Prompt 中，丰富 Qwen 的理解上下文
+        # 如果 train.py 里没有这么写，在此处合并最保险
+        full_prompt = [f"Context: {cap}. {prompt}" for cap in caption] if isinstance(caption, list) else [f"Context: {caption}. {prompt}"] * B
         
         llm_tokens = self.llm_tokenizer(
-            [prompt] * video.size(0),
+            full_prompt,
             padding="longest",
             return_tensors="pt"
-        ).to(video.device)
+        ).to(device)
 
+        # ==========================================================
+        # 5. 前向传播与 Logits 打分提取
+        # ==========================================================
         with self.maybe_autocast():
-            inputs_embeds = self.llm_model.get_input_embeddings()(llm_tokens.input_ids)
-            inputs_embeds = torch.cat([inputs_llm.to(dtype=inputs_embeds.dtype), inputs_embeds], dim=1)
-            attention_mask = torch.cat([atts_llm, llm_tokens.attention_mask], dim=1)
+            # 提取纯文本的 embedding
+            text_embeds = self.llm_model.get_input_embeddings()(llm_tokens.input_ids)
+            
+            # 将多模态 Token 放在文本 Token 前面，并且必须统一 dtype(bfloat16)
+            inputs_embeds = torch.cat([multimodal_embeds.to(text_embeds.dtype), text_embeds], dim=1)
+            attention_mask = torch.cat([atts_multimodal, llm_tokens.attention_mask], dim=1)
 
             outputs = self.llm_model(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                )
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+            )
             
+        # 提取整个序列预测下一个词的 Logits
         output_logits = outputs.logits[:, -1]
-        lexcellent, lgood, lfair, lpoor, lbad = output_logits[:, self.excellent_idx], output_logits[:, self.good_idx], output_logits[:, self.fair_idx], output_logits[:,self.poor_idx], output_logits[:, self.bad_idx]
+        
+        # 抓取 5 个评价词的概率
+        lexcellent = output_logits[:, self.excellent_idx]
+        lgood = output_logits[:, self.good_idx]
+        lfair = output_logits[:, self.fair_idx]
+        lpoor = output_logits[:, self.poor_idx]
+        lbad = output_logits[:, self.bad_idx]
+        
+        # 归一化并加权求和得出最终回归分数 (Softmax + Expected Value)
         q_pred = (torch.stack([lexcellent, lgood, lfair, lpoor, lbad]) / 100).softmax(0)
-        weights = self.weights.expand(-1, q_pred.shape[1]).to(video.device)
+        weights = self.weights.expand(-1, q_pred.shape[1]).to(device)
         q_pred = torch.mul(q_pred, weights)
         q_pred = torch.sum(q_pred, dim=0)
 
         return q_pred
 
 
-
-
-
-
-
-
 if __name__=="__main__":
     device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
-    model = T2VQA(med_config='../configs/med_config.json', image_size = 224).to(device)
+    
+    # 模拟外部传入参数
+    mock_args = {
+        'clip_len': 8,
+        'llm_model': 'Qwen/Qwen2.5-7B-Instruct', # 这里填写你的 Qwen 本地路径
+        'clip_weights': 'openai/clip-vit-large-patch14',
+    }
+    
+    model = T2VQA(args=mock_args).to(device)
     model.eval()
-    caption = 'A random caption'
-    prompt = 'Please assess the quality of this image'
+    
+    # 模拟数据输入
+    caption = ['A random caption about a dog'] * 2
+    prompt = 'Carefully watch the video and evaluate its quality. The overall quality of this video is'
     video = torch.randn(2, 3, 8, 224, 224).to(device)
+    data = {'video': video}
 
     with torch.no_grad():
-        output = model(video, caption, prompt)
-    print(output)        
+        output = model(data, caption, prompt)
+    print("Predicted Scores:", output)

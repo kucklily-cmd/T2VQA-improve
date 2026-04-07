@@ -2,9 +2,8 @@ name: T2VQA
 num_epochs: 30
 warmup_epochs: 2.5
 save_model: true
-batch_size: 8
-num_workers: 6
-# split_seed: -1
+batch_size: 4  # 【注意】Qwen-7B 加上三分支特征提取显存占用较大，如果 8 爆显存 (OOM)，请改为 4 或 2
+num_workers: 8
 split_seed: 1
 
 wandb:
@@ -15,7 +14,6 @@ data:
         type: T2VDataset
         args:
             phase: train
-            # anno_file: /root/autodl-tmp/info_sub5000_train4000.txt
             anno_file: /data/TeamMember/lm/sy/project/info.txt
             data_prefix: /data/TeamMember/lm/sy/project/T2VQA-DB
             size: 224
@@ -42,29 +40,27 @@ data:
             clip_len: 8
             frame_interval: 2
 
-
-
 model:
     args:
-        med_config: '/data/TeamMember/lm/sy/project/models/T2VQA-main//med_config.json'
+        # 基础参数
         image_size: 224
-        nhead: 8
-        dropout: 0.1
-        nlayers: 6
-        embed_dim: 256 
-        llm_model: /data/TeamMember/lm/sy/project/models/lmsys/vicuna-7b-v1___1/
-        blip_weights: /data/TeamMember/lm/sy/project/models/model_large.pth
-        swin_weights: /data/TeamMember/lm/sy/project/models/swin_tiny_patch244_window877_kinetics400_1k.pth
-        conv_weights: /data/TeamMember/lm/sy/project/models/convnext_3d_tiny_3.pth
-        bert_weights: /data/TeamMember/lm/sy/project/models/bert-base-uncased
+        clip_len: 8  # 保持与 data 里的 clip_len 一致，用于控制 SlowFast 和 ConvNeXt 的时序 Token 数量
+        
+        # 1. 语言模型 (Qwen)
+        # 【必须修改】将这里替换为你下载好的 Qwen2.5-7B-Instruct 的本地绝对路径
+        llm_model: /home/sy/.cache/modelscope/hub/models/Qwen/Qwen2.5-7B-Instruct
+        
+        # 2. 语义分支 (CLIP)
+        # 如果服务器能联网，填 'openai/clip-vit-large-patch14' 会自动下载
+        # 如果断网，请填入你本地下载好的 CLIP 权重文件夹路径
+        clip_weights: /home/sy/.cache/modelscope/hub/models/AI-ModelScope/clip-vit-large-patch14
+        
+        # 3. 美学分支 (ConvNeXt)
+        # 继续使用之前的 COVER 预训练权重
         aesthetic_weights: /data/TeamMember/lm/sy/project/models/COVER.pth 
             
 optimizer:
     lr: !!float 1e-5
     wd: 0.05
         
-
-test_load_path: "/data/TeamMember/lm/sy/project/models/T2VQA-main/threeBranch.pth"
-
-    
-        
+test_load_path: "/data/TeamMember/lm/sy/project/models/T2VQA-main/pretrained_weights/threeBranch.pth"

@@ -1,5 +1,4 @@
 import torch
-
 import cv2
 import random
 import os.path as osp
@@ -30,13 +29,13 @@ def train_test_split(dataset_path, ann_file, ratio=0.8, seed=42):
         for line in fin.readlines():
             line_split = line.strip().split("|")
             filename, prompt, label = line_split
-            label = float(label)# 得分
+            label = float(label) # 得分
             filename = osp.join(dataset_path, filename)
             video_infos.append(dict(filename=filename, prompt=prompt, label=label))
     random.shuffle(video_infos)
     return (
-        video_infos[: int(ratio * len(video_infos))],# 训练集
-        video_infos[int(ratio * len(video_infos)) :],# 测试集
+        video_infos[: int(ratio * len(video_infos))], # 训练集
+        video_infos[int(ratio * len(video_infos)) :], # 测试集
     )
 
 def plcc_loss(y_pred, y):
@@ -58,9 +57,7 @@ def rank_loss(y_pred, y):
         torch.sum(ranking_loss) / y_pred.shape[0] / (y_pred.shape[0] - 1) / scale
     ).float()
 
-# 待看
 def rescale(pr, gt=None):
-
     if gt is None:
         pr = (pr - np.mean(pr)) / np.std(pr)
     else:
@@ -76,27 +73,26 @@ def finetune_epoch(
     epoch=-1,
 ):
     model.train()
-    total_loss = 0.0  # 新增：用于累加当前 epoch 的总 loss
+    total_loss = 0.0  
+    
+    # Qwen 专用引导式填空 Prompt
+    prompt_template = 'Carefully watch the video and evaluate its quality from the aspects of temporal consistency, aesthetic beauty, and semantic alignment. The overall quality of this video is'
+    
     for i, data in enumerate(tqdm(ft_loader, desc=f"Training in epoch {epoch}")):
         optimizer.zero_grad()
-        video = {}
-        video["video"] = data["video"].to(device)
-        video["frame_inds"] = data["frame_inds"].to(device)
+        
+        # 组装传入 model 的数据字典，确保适配重构后 model.py 要求的设备存放
+        inputs = {}
+        inputs["video"] = data["video"].to(device)
+        if "video_aesthetic" in data:
+            inputs["video_aesthetic"] = data["video_aesthetic"].to(device)
 
         y = data["gt_label"].float().detach().to(device)
-
         caption = data['prompt']
-        
-        prompt = 'Please assess the quality of this video'
 
-        scores = model(video, caption = caption, prompt = prompt)
+        scores = model(inputs, caption=caption, prompt=prompt_template)
 
         y_pred = scores
-        # if len(scores) > 1:
-        #     y_pred = reduce(lambda x, y: x + y, scores)
-        # else:
-        #     y_pred = scores[0]
-        # y_pred = y_pred.mean((-3, -2, -1))
 
         p_loss = plcc_loss(y_pred, y)
         r_loss = rank_loss(y_pred, y)
@@ -107,12 +103,11 @@ def finetune_epoch(
         optimizer.step()
         scheduler.step()
 
-        # ft_loader.dataset.refresh_hypers()
-        total_loss += loss.item()  # 新增：累加 loss
+        total_loss += loss.item()
 
     model.eval()
-    avg_loss = total_loss / len(ft_loader)  # 新增：计算平均 loss
-    return avg_loss  # 新增：返回当前轮次的平均 loss
+    avg_loss = total_loss / len(ft_loader)  
+    return avg_loss  
 
 def inference_set(
     inf_loader,
@@ -124,35 +119,30 @@ def inference_set(
     save_name="divide",
     save_type="head",
 ):
-
     results = []
-
     best_s, best_p, best_k, best_r = best_
+
+    prompt_template = 'Carefully watch the video and evaluate its quality from the aspects of temporal consistency, aesthetic beauty, and semantic alignment. The overall quality of this video is'
 
     for i, data in enumerate(tqdm(inf_loader, desc="Validating")):
         result = dict()
-        video, video_up = {}, {}
+        inputs, video_up = {}, {}
 
-        video['video'] = data['video'].to(device)
-        
-        ## Reshape into clips
-        b, c, t, h, w = video['video'].shape
+        inputs['video'] = data['video'].to(device)
+        if "video_aesthetic" in data:
+            inputs["video_aesthetic"] = data["video_aesthetic"].to(device)
             
         with torch.no_grad():
-            prompt = 'Please assess the quality of this video'
-
             caption = data['prompt']
-
-            result["pr_labels"] = model(video, caption = caption, prompt = prompt).cpu().numpy()
+            result["pr_labels"] = model(inputs, caption=caption, prompt=prompt_template).cpu().numpy()
 
             if len(list(video_up.keys())) > 0:
                 result["pr_labels_up"] = model(video_up).cpu().numpy()
 
         result["gt_label"] = data["gt_label"].item()
-        del video, video_up
+        del inputs, video_up
         results.append(result)
 
-    ## generate the demo video for video quality localization
     gt_labels = [r["gt_label"] for r in results]
     pr_labels = [np.mean(r["pr_labels"]) for r in results]
     pr_labels = rescale(pr_labels, gt_labels)
@@ -162,16 +152,7 @@ def inference_set(
     k = kendallr(gt_labels, pr_labels)[0]
     r = np.sqrt(((gt_labels - pr_labels) ** 2).mean())
 
-    # wandb.log(
-    #     {
-    #         f"val_{suffix}/SRCC-{suffix}": s,
-    #         f"val_{suffix}/PLCC-{suffix}": p,
-    #         f"val_{suffix}/KRCC-{suffix}": k,
-    #         f"val_{suffix}/RMSE-{suffix}": r,
-    #     }
-    # )
-
-    del results, result  # , video, video_up
+    del results, result  
     torch.cuda.empty_cache()
 
     if s + p > best_s + best_p and save_model:
@@ -180,13 +161,13 @@ def inference_set(
         if save_type == "head":
             head_state_dict = OrderedDict()
             for key, v in state_dict.items():
+                # 修改：适配重构后的参数名称
                 if (
-                    "finetune" in key
-                    or "swin" in key
-                    or "conv" in key
-                    or "gate_mixer" in key
+                    "semantic_proj" in key
+                    or "motion_proj" in key
+                    or "aesthetic_proj" in key
                     or "slowfast" in key
-                    or "blip.text_encoder" in key
+                    or "aesthetic_conv3d" in key
                 ):
                     head_state_dict[key] = v
             print("Following keys are saved (for head-only):", head_state_dict.keys())
@@ -207,7 +188,6 @@ def inference_set(
         min(best_r, r),
     )
 
-
     print(
         f"For {len(inf_loader)} videos, \nthe accuracy of the model: [{suffix}] is as follows:\n  SROCC: {s:.4f} best: {best_s:.4f} \n  PLCC:  {p:.4f} best: {best_p:.4f}  \n  KROCC: {k:.4f} best: {best_k:.4f} \n  RMSE:  {r:.4f} best: {best_r:.4f}."
     )
@@ -216,15 +196,13 @@ def inference_set(
 
 
 def main():
-    # 参数解析器
-    # 解析命令行传入参数格式 python train.py --opt my_config.yml
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "-o", "--opt", type=str, default="t2vqa.yml", help="the option file"# 配置文件
+        "-o", "--opt", type=str, default="t2vqa.yml", help="the option file"
     )
 
     parser.add_argument(
-        "-t", "--target_set", type=str, default="t2v", help="target_set"# 数据集
+        "-t", "--target_set", type=str, default="t2v", help="target_set"
     )
 
     args = parser.parse_args()
@@ -232,14 +210,9 @@ def main():
         opt = yaml.safe_load(f)
     print(opt)
 
-    ## adaptively choose the device
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    ## defining model and loading checkpoint
-
     bests_ = []
-    # 找不到这个字段返回-1
     if opt.get("split_seed", -1) > 0:
         num_splits = 10
     else:
@@ -248,10 +221,9 @@ def main():
     print(opt["split_seed"])
 
     for split in range(num_splits):
-        model = T2VQA(opt["model"]["args"]).to(device)# 把模型方式GPU
+        model = T2VQA(opt["model"]["args"]).to(device)
+        
         if opt.get("split_seed", -1) > 0:
-            # 配置文件的结构应该是data target 还有T2VQA 指明它的一些数据集配置内容
-            # 数据集划分逻辑
             opt["data"]["train"] = copy.deepcopy(opt["data"][args.target_set])
             opt["data"]["eval"] = copy.deepcopy(opt["data"][args.target_set])
 
@@ -301,24 +273,23 @@ def main():
                 pin_memory=True,
             )
 
-        # 利用参数组实现部分更新的策略
+        # 修改：精确解耦参数组，针对三分支架构
         param_groups = []   
-
         for name, param in model.named_parameters():
-            
             if (
-                "finetune" in name
-                or "swin" in name
-                or "conv3d" in name
-                or "gate_mixer" in name
+                "semantic_proj" in name
+                or "motion_proj" in name
+                or "aesthetic_proj" in name
                 or "slowfast" in name
-                or "blip.text_encoder" in name
+                or "aesthetic_conv3d" in name
             ):
-
+                param.requires_grad = True
                 param_groups += [
                         {"params": param, "lr": opt["optimizer"]["lr"]}
                 ]
-
+            else:
+                # 明确冻结不包含在上述列表中的参数（例如 LLM 和 CLIP）
+                param.requires_grad = False
 
         optimizer = torch.optim.AdamW(
             lr=opt["optimizer"]["lr"],
@@ -326,33 +297,29 @@ def main():
             weight_decay=opt["optimizer"]["wd"],
         )
 
-        #训练轮数计算 
         warmup_iter = 0 
         for train_loader in train_loaders.values():
             warmup_iter += int(opt["warmup_epochs"] * len(train_loader))
         max_iter = int((opt["num_epochs"]) * len(train_loader))
 
-        #线性热身，余弦退火，学习率策略
         lr_lambda = (
             lambda cur_iter: cur_iter / warmup_iter
             if cur_iter <= warmup_iter
             else 0.5 * (1 + math.cos(math.pi * (cur_iter - warmup_iter) / max_iter))
         )
 
-        #控制哪一个优化器，自定义学习率策略
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda,)
 
-        # python元组存储四个不同的指标
         bests = {}
         for key in val_loaders:
             bests[key] = -1, -1, -1, 1000
-        history_log = []  # 新增：初始化用于记录所有轮次数据的列表
+        history_log = []  
+        
         for epoch in range(opt["num_epochs"]):
             print(f"End-to-end Epoch {epoch}:")
             epoch_train_loss = 0.0  
             
             for key, train_loader in train_loaders.items():
-                # 接收当前 epoch 的训练 loss
                 epoch_train_loss = finetune_epoch(
                     train_loader,
                     model,
@@ -362,14 +329,12 @@ def main():
                     epoch,
                 )
             
-            # 初始化当前 epoch 的数据字典
             epoch_data = {
                 "epoch": epoch,
                 "train_loss": epoch_train_loss
             }
 
             for key in val_loaders:
-                # 拆包接收历史最佳指标和当前指标
                 bests[key], current_metrics = inference_set(
                     val_loaders[key],
                     model,
@@ -381,28 +346,23 @@ def main():
                     save_type="head",
                 )
                 
-                # 将当前轮次的各项指标提取到字典中
                 s, p, k, r = current_metrics
                 epoch_data[f"val_{key}_SRCC"] = float(s)
                 epoch_data[f"val_{key}_PLCC"] = float(p)
                 epoch_data[f"val_{key}_KRCC"] = float(k)
                 epoch_data[f"val_{key}_RMSE"] = float(r)
             
-            # 将当前轮次数据加入总记录中
             history_log.append(epoch_data)
             
-            # 每一轮结束将纯数据落盘保存（覆盖更新），无需保存模型权重
             with open(f"training_history_split{split}.json", "w", encoding="utf-8") as f:
                 json.dump(history_log, f, indent=4)
             
-
-        # 精准解锁模型中的特定子模块，允许它们在训练过程中更新参数。
+        # 修改：训练结束后如果有需要解锁的操作，必须适配新的模块名称
         for key, value in dict(model.named_children()).items():
-            if "finetune" in key or "swin" in key or "conv" in key or "gate_mixer" in key or "slowfast" in key:
+            if "proj" in key or "slowfast" in key or "aesthetic_conv3d" in key:
                 for param in value.parameters():
                     param.requires_grad = True
 
-        #清理结尾
         del model
         torch.cuda.empty_cache()
 
