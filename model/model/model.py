@@ -9,14 +9,16 @@ from peft import LoraConfig, get_peft_model
 # 引入 Qwen 相关的 Auto 类和 CLIP
 from transformers import AutoModelForCausalLM, AutoTokenizer, CLIPVisionModel
 import torchvision.models.video as video_models
-
+from transformers import Blip2Model, Blip2Processor # 【新增】BLIP-2 相关库
 # 保留你原有的 ConvNeXt3D 导入
 from model.conv_backbone import convnext_3d_tiny
+# 1. 在文件开头增加以下导入
+from transformers import AutoModelForCausalLM, AutoTokenizer, Blip2Model, AutoTokenizer as Blip2Tokenizer
 
 def disabled_train(self, mode=True):
     """Overwrite model.train with this function to make sure train/eval mode does not change anymore."""
     return self
-class TextConditionedQFormer(nn.Module):
+class TextConditionedQFormer(nn.Module): 
     def __init__(self, clip_dim=1024, text_dim=3584, embed_dim=768, out_dim=3584, num_queries=8):
         super().__init__()
         self.num_queries = num_queries
@@ -179,25 +181,30 @@ class T2VQA(nn.Module):
         hidden_size = self.llm_model.config.hidden_size
 
         # ==========================================================
-        # 2. 空间语义分支 (CLIP)
+        # 2. 空间语义分支 (升级为 BLIP-2 + LoRA)
         # ==========================================================
-        clip_weights = args.get('clip_weights', 'openai/clip-vit-large-patch14')
-        self.clip = CLIPVisionModel.from_pretrained(clip_weights)
-        clip_dim = self.clip.config.hidden_size # ViT-Large 为 1024
+        # 推荐使用 blip2-opt-2.7b 作为基座（我们不用它的OPT模型，只借用它的视觉和Q-Former权重）
+        blip2_path = args.get('blip2_model', "Salesforce/blip2-opt-2.7b") 
+        self.blip2_tokenizer = Blip2Tokenizer.from_pretrained(blip2_path)
         
-        # 冻结 CLIP 参数
-        for param in self.clip.parameters():
+        # 加载 Blip2Model (不含语言生成头)
+        self.blip2 = Blip2Model.from_pretrained(blip2_path, torch_dtype=torch.bfloat16)
+
+        # 冻结视觉编码器 (EVA-CLIP)
+        for param in self.blip2.vision_model.parameters():
             param.requires_grad = False 
             
-        # 【修改这里】：删除 self.semantic_proj = nn.Linear(...)
-        # 引入定制化 Q-Former，确保输出正好是 T 个 Token
-        self.qformer = TextConditionedQFormer(
-            clip_dim=clip_dim,
-            text_dim=hidden_size,  # Qwen2.5 的 3584 维
-            embed_dim=768,         # 内部计算维度
-            out_dim=hidden_size,   # 输出给 Qwen 的 3584 维
-            num_queries=self.T     # 固定输出 T 个 Token
+        # 【新增】：对 Q-Former 应用 LoRA
+        # Q-Former 内部是类 BERT 结构，target_modules 使用 attention 的关键层
+        peft_config_qformer = LoraConfig(
+            r=16, lora_alpha=32, lora_dropout=0.05,
+            target_modules=["query", "key", "value", "dense"] 
         )
+        self.blip2.qformer = get_peft_model(self.blip2.qformer, peft_config_qformer)
+        self.blip2.qformer.print_trainable_parameters() # 确认 Q-Former LoRA 注入成功
+
+        # 投影层：将 Q-Former 输出 (通常为 768 维) 映射到 Qwen (3584 维)
+        self.semantic_proj = nn.Linear(self.blip2.config.qformer_config.hidden_size, hidden_size)
 
         # ==========================================================
         # 3. 运动与技术质量分支 (SlowFast-R50)
@@ -261,33 +268,57 @@ class T2VQA(nn.Module):
         video_aesthetic = data.get('video_aesthetic', video)
 
         # ==========================================================
-        # 1. 空间语义分支 (CLIP) - 提取 T 个 Token
+        # 1. 空间语义分支 (BLIP-2 Vision + Q-Former)
         # ==========================================================
-        # 将视频折叠为 [B*T, 3, H, W] 逐帧输入 CLIP
         frames = video.transpose(1, 2).reshape(B * T, C, H, W)
+        
+        # 确保数据类型对齐 (输入转为与 blip2 相同的 bfloat16)
+        frames = frames.to(self.blip2.dtype) 
+        
+        # A. 提取视觉特征 (无梯度)
         with torch.no_grad():
-            clip_outputs = self.clip(pixel_values=frames)
-            # 使用全局 [CLS] token 表征整帧的语义 [B*T, 1024]
-            semantic_features = clip_outputs.pooler_output 
+            vision_outputs = self.blip2.vision_model(pixel_values=frames)
+            image_embeds = vision_outputs[0] # [B*T, num_patches, hidden_size]
             
-        # 恢复批次和时序维度 [B, T, 1024]
-        semantic_tokens = semantic_features.view(B, T, -1) 
-        # 【新增】：提取纯 Caption 的文本特征，作为 Q-Former 的条件
-        cap_tokens = self.llm_tokenizer(
-            caption,
-            padding=True,
+        # B. 准备 Q-Former 的文本条件
+        # 因为 frames 维度是 B*T，我们需要把 batch 为 B 的 caption 复制 T 遍对齐
+        expanded_captions = [cap for cap in caption for _ in range(T)]
+        text_inputs = self.blip2_tokenizer(
+            expanded_captions, 
+            padding=True, 
             return_tensors="pt"
         ).to(device)
 
-        with torch.no_grad(): # LLM 是冻结的，这里不需要算梯度
-            cap_embeds = self.llm_model.get_input_embeddings()(cap_tokens.input_ids) # [B, L, 3584]
+        # C. Q-Former 多模态交互 (带梯度更新 LoRA)
+        # 1. 提取 BLIP-2 内置的 Query Tokens
+        query_tokens = self.blip2.query_tokens.expand(B * T, -1, -1)
+        
+        # 2. 【新增】：手动拼接 Attention Mask
+        # Query Tokens 永远是有效的，所以给它们生成全是 1 的 mask
+        query_mask = torch.ones(
+            B * T, query_tokens.shape[1], 
+            dtype=text_inputs.attention_mask.dtype, 
+            device=device
+        )
+        # 将 Query Mask (32) 和 Text Mask (L) 在序列维度拼接 -> 长度变为 32 + L
+        qformer_attention_mask = torch.cat([query_mask, text_inputs.attention_mask], dim=1)
 
-        # 【修改这里】：不再使用 semantic_proj，而是经过 Q-Former
-        semantic_embeds = self.qformer(
-            video_feats=semantic_tokens, 
-            text_feats=cap_embeds,
-            text_mask=cap_tokens.attention_mask
-        ) # 输出形状保持 [B, T, 3584] 不变
+        # 3. 送入 Q-Former (传入拼接后的完整 Mask)
+        qformer_outputs = self.blip2.qformer(
+            query_embeds=query_tokens,
+            input_ids=text_inputs.input_ids,
+            attention_mask=qformer_attention_mask,  # <--- 使用补齐后的完整 Mask
+            encoder_hidden_states=image_embeds,
+        )
+        
+        # qformer_outputs.last_hidden_state 形状是 [B*T, num_queries(通常32), 768]
+        # 对 32 个 Query 求均值，代表每一帧浓缩后的语义特征
+        frame_semantic = qformer_outputs.last_hidden_state.mean(dim=1) # [B*T, 768]
+
+        # 恢复时序维度并进行通道映射
+       # 恢复时序维度，并动态对齐到投影层的数据类型 (Float32)
+        semantic_tokens = frame_semantic.view(B, T, -1).to(self.semantic_proj.weight.dtype)
+        semantic_embeds = self.semantic_proj(semantic_tokens) # [B, T, 3584]
 
         # ==========================================================
         # 2. 运动分支 (SlowFast) - 提取 T 个 Token

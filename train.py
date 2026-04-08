@@ -274,20 +274,20 @@ def main():
             )
 
         # 修改：精确解耦参数组，针对三分支架构 + LoRA
+        # 修改：精确解耦参数组
         param_groups = []   
         for name, param in model.named_parameters():
             if (
-                "qformer" in name
+                "qformer" in name          # 捕获 BLIP-2 Q-Former 的 LoRA
+                or "semantic_proj" in name # 捕获映射层
+                or "lora" in name          # 捕获 Qwen 的 LoRA
                 or "motion_proj" in name
                 or "aesthetic_proj" in name
                 or "slowfast" in name
                 or "aesthetic_conv3d" in name
-                or "lora" in name # 【新增】：确保 lora 权重参与梯度更新
             ):
                 param.requires_grad = True
-                param_groups += [
-                        {"params": param, "lr": opt["optimizer"]["lr"]}
-                ]
+                param_groups += [{"params": param, "lr": opt["optimizer"]["lr"]}]
             else:
                 param.requires_grad = False
 
