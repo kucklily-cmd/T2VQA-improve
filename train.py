@@ -315,7 +315,42 @@ def main():
             bests[key] = -1, -1, -1, 1000
         history_log = []  
         
-        for epoch in range(opt["num_epochs"]):
+        # ================= 【新增】：断点续训 (Auto-Resume) 加载逻辑 =================
+        start_epoch = 0
+        os.makedirs("pretrained_weights", exist_ok=True)
+        latest_ckpt_path = f"pretrained_weights/{opt['name']}_latest_{args.target_set}_{split}.pth"
+        
+        if os.path.exists(latest_ckpt_path):
+            print(f"\n[*] 发现中断的训练状态: {latest_ckpt_path}。正在恢复...")
+            checkpoint = torch.load(latest_ckpt_path, map_location=device)
+            
+            # 1. 恢复模型权重 (使用 strict=False，因为我们为了省空间只存了参与训练的权重)
+            model.load_state_dict(checkpoint["state_dict"], strict=False)
+            
+            # 2. 恢复优化器和学习率调度器状态 (非常重要，否则动量和学习率会重置，导致Loss爆炸)
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            scheduler.load_state_dict(checkpoint["scheduler"])
+            
+            # 3. 恢复进度和最佳指标
+            start_epoch = checkpoint["epoch"] + 1
+            bests = checkpoint.get("bests", bests)
+            
+            # 4. 恢复历史 JSON 日志避免被覆盖
+            log_file = f"training_history_split{split}.json"
+            if os.path.exists(log_file):
+                with open(log_file, "r", encoding="utf-8") as f:
+                    try:
+                        history_log = json.load(f)
+                    except Exception:
+                        pass
+                        
+            print(f"[*] 成功从第 {checkpoint['epoch']} 个 epoch 恢复。下一个执行的 epoch 将是 {start_epoch}\n")
+        # =========================================================================
+        
+        # 【修改】：将起始 epoch 从 0 改为 start_epoch
+        for epoch in range(start_epoch, opt["num_epochs"]):
+            print(f"End-to-end Epoch {epoch}:")
+            epoch_train_loss = 0.0
             print(f"End-to-end Epoch {epoch}:")
             epoch_train_loss = 0.0  
             
@@ -356,6 +391,63 @@ def main():
             
             with open(f"training_history_split{split}.json", "w", encoding="utf-8") as f:
                 json.dump(history_log, f, indent=4)
+            
+           # ================= 【增强】：带有防爆盘机制的 Checkpoint 保存逻辑 =================
+            head_state_dict = OrderedDict()
+            for k_name, v_param in model.state_dict().items():
+                if (
+                    "qformer" in k_name
+                    or "motion_proj" in k_name
+                    or "aesthetic_proj" in k_name
+                    or "slowfast" in k_name
+                    or "aesthetic_conv3d" in k_name
+                    or "lora" in k_name
+                ):
+                    head_state_dict[k_name] = v_param
+                    
+            latest_state = {
+                "epoch": epoch,
+                "state_dict": head_state_dict,
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "bests": bests
+            }
+            
+            # 使用临时文件进行原子化保存
+            tmp_ckpt_path = latest_ckpt_path + ".tmp"
+            json_file = f"training_history_split{split}.json"
+            tmp_json_file = json_file + ".tmp"
+            
+            try:
+                # 1. 安全保存 JSON 日志
+                with open(tmp_json_file, "w", encoding="utf-8") as f:
+                    json.dump(history_log, f, indent=4)
+                os.replace(tmp_json_file, json_file) # os.replace 在 Linux 下是原子操作
+                
+                # 2. 安全保存 Checkpoint 权重
+                torch.save(latest_state, tmp_ckpt_path)
+                os.replace(tmp_ckpt_path, latest_ckpt_path)
+                
+                print(f"[*] 用于防崩溃的最新 checkpoint 已安全保存至 {latest_ckpt_path}")
+                
+            except Exception as e:
+                print(f"\n[!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!]")
+                print(f"[!] 警告: 保存 checkpoint 或日志失败 (大概率是磁盘空间已满)！")
+                print(f"[!] 错误详情: {e}")
+                print(f"[!] 已启动退化保护: 跳过当前 epoch ({epoch}) 的存档，上一次的完好存档已受保护。")
+                print(f"[!] 模型将继续训练，请尽快清理服务器磁盘空间！")
+                print(f"[!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!]\n")
+                
+                # 如果写了一半爆盘，顺手把残缺的 tmp 文件删掉，避免一直占着微薄的空间
+                for tmp_file in [tmp_ckpt_path, tmp_json_file]:
+                    if os.path.exists(tmp_file):
+                        try:
+                            os.remove(tmp_file)
+                        except Exception:
+                            pass
+            # =========================================================================
+
+        # 修改：训练结束后如果有需要解锁的操作 (你原本的代码)
             
         # 修改：训练结束后如果有需要解锁的操作
         for key, value in dict(model.named_children()).items():
