@@ -7,8 +7,8 @@ import copy
 
 # 引入 PEFT
 from peft import LoraConfig, get_peft_model
-# 引入 Qwen 和 Blip2 (只需要模型，不需要 Blip2 的 Processor 和 Tokenizer 了)
-from transformers import AutoModelForCausalLM, AutoTokenizer, Blip2Model
+# 【修改 1】：引入原版 BlipVisionModel
+from transformers import AutoModelForCausalLM, AutoTokenizer, BlipVisionModel
 
 # 保留你原有的 ConvNeXt3D 导入
 from model.conv_backbone import convnext_3d_tiny
@@ -22,15 +22,15 @@ def disabled_train(self, mode=True):
 # 原生 PyTorch 文本引导感知重采样器 (完美替代 Q-Former)
 # ==========================================================
 class NativeTextConditionedQFormer(nn.Module):
-    def __init__(self, vision_dim=1408, text_dim=3584, embed_dim=768, out_dim=3584, num_queries=32, num_layers=4):
+    def __init__(self, vision_dim=768, text_dim=3584, embed_dim=768, out_dim=3584, num_queries=32, num_layers=4):
         super().__init__()
         self.num_queries = num_queries
         
-        # 1. 降维投影：将视觉特征和文本特征降到统一的工作维度 (768)
+        # 1. 降维投影
         self.vision_proj = nn.Linear(vision_dim, embed_dim)
         self.text_proj = nn.Linear(text_dim, embed_dim)
 
-        # 2. 可学习的 Query Tokens (代表模型自带的视觉信息提取模板)
+        # 2. 可学习的 Query Tokens
         self.query_tokens = nn.Parameter(torch.randn(1, num_queries, embed_dim) * 0.02)
 
         # 3. 核心交互网络：使用 PyTorch 原生 Transformer Decoder
@@ -39,49 +39,37 @@ class NativeTextConditionedQFormer(nn.Module):
             nhead=8,
             dim_feedforward=embed_dim * 4,
             batch_first=True,
-            norm_first=True,  # 开启 norm_first 让深层训练更稳定
+            norm_first=True,
             activation='gelu'
         )
         self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=num_layers) 
 
-        # 4. 输出投影：直接升维回 LLM 所需的特征维度 (3584)
+        # 4. 输出投影
         self.out_proj = nn.Linear(embed_dim, out_dim)
 
     def forward(self, vision_feats, text_feats, text_mask=None):
         B = vision_feats.size(0)
 
-        # [B, T_v, embed_dim]
         memory = self.vision_proj(vision_feats) 
-        # [B, T_t, embed_dim]
         t_embeds = self.text_proj(text_feats)   
 
-        # 扩展 Query Tokens 匹配 batch size -> [B, num_queries, embed_dim]
         queries = self.query_tokens.expand(B, -1, -1)
+        tgt = torch.cat([queries, t_embeds], dim=1) 
 
-        # 关键操作：在序列维度拼接 Query 和 Text
-        tgt = torch.cat([queries, t_embeds], dim=1) # [B, num_queries + T_t, embed_dim]
-
-        # 处理文本的 padding mask
         if text_mask is not None:
-            # Query 部分全为有效 (False 代表不 mask)
             query_mask = torch.zeros(B, self.num_queries, dtype=torch.bool, device=tgt.device)
-            # PyTorch Transformer 中 True 代表忽略(Mask)，所以取反
             t_pad_mask = ~(text_mask.bool()) 
             tgt_key_padding_mask = torch.cat([query_mask, t_pad_mask], dim=1)
         else:
             tgt_key_padding_mask = None
 
-        # 穿越 Transformer 提取特征
         out = self.transformer(
             tgt=tgt,
             memory=memory,
             tgt_key_padding_mask=tgt_key_padding_mask
         )
 
-        # 剥离出 Query 部分的输出作为最终的融合特征，抛弃文本部分
-        q_out = out[:, :self.num_queries, :] # [B, num_queries, embed_dim]
-
-        # 升维并返回 -> [B, num_queries, out_dim]
+        q_out = out[:, :self.num_queries, :] 
         return self.out_proj(q_out)
 
 
@@ -89,7 +77,6 @@ class CustomSlowFast(nn.Module):
     def __init__(self, T_out=8, local_weight_path=None):
         super().__init__()
         
-        # 1. 离线加载 base 模型
         pytorchvideo_dir = '/data/TeamMember/lm/sy/project/models/pytorchvideo-main' 
         base = torch.hub.load(pytorchvideo_dir, 'slowfast_r50', source='local', pretrained=False)
         
@@ -100,14 +87,12 @@ class CustomSlowFast(nn.Module):
             base.load_state_dict(state_dict)
             print("Successfully loaded local SlowFast weights.")
             
-        # 2. 终极物理隔离：彻底抛弃分类头
         self.stem = base.blocks[0]
         self.stage1 = base.blocks[1]
         self.stage2 = base.blocks[2]
         self.stage3 = base.blocks[3]
         self.stage4 = base.blocks[4]
         
-        # 3. Token 平衡
         self.pool = nn.AdaptiveAvgPool3d((T_out, 1, 1))
 
     def forward(self, x):
@@ -148,17 +133,23 @@ class T2VQA(nn.Module):
         for name, param in self.llm_model.named_parameters():
             param.requires_grad = False
             
-        peft_config = LoraConfig(
-            task_type="CAUSAL_LM",
-            inference_mode=False,
-            r=16,          
-            lora_alpha=32,
-            lora_dropout=0.05,
-            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"] 
-        )
-        self.llm_model = get_peft_model(self.llm_model, peft_config)
-        self.llm_model.print_trainable_parameters() 
-        
+        # 【新增】：配置文件控制 LLM LoRA
+        use_llm_lora = args.get('use_llm_lora', True)
+        if use_llm_lora:
+            peft_config = LoraConfig(
+                task_type="CAUSAL_LM",
+                inference_mode=False,
+                r=16,          
+                lora_alpha=32,
+                lora_dropout=0.05,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"] 
+            )
+            self.llm_model = get_peft_model(self.llm_model, peft_config)
+            print("=> LLM LoRA is ENABLED.")
+            self.llm_model.print_trainable_parameters() 
+        else:
+            print("=> LLM LoRA is DISABLED.")
+
         target_words = [" excellent", " good", " fair", " poor", " bad"]
         word_ids = []
         for word in target_words:
@@ -171,22 +162,36 @@ class T2VQA(nn.Module):
         hidden_size = self.llm_model.config.hidden_size
 
         # ==========================================================
-        # 2. 空间语义分支 (原生文本引导 Q-Former)
+        # 2. 空间语义分支 (原生 BLIP 编码器 + 配置文件控制的 LoRA)
         # ==========================================================
-        blip2_path = args.get('blip2_model', "Salesforce/blip2-opt-2.7b") 
-        # 加载 Blip2Model (只取用视觉部分)
-        self.blip2 = Blip2Model.from_pretrained(blip2_path, torch_dtype=torch.bfloat16, local_files_only=True)
+        blip_path = args.get('blip_weights', "Salesforce/blip-image-captioning-base") 
+        # 只加载 BLIP 的视觉部分
+        self.blip_vision = BlipVisionModel.from_pretrained(blip_path, torch_dtype=torch.bfloat16, local_files_only=True)
 
-        # 冻结 EVA-CLIP 视觉编码器
-        for param in self.blip2.vision_model.parameters():
+        # 初始冻结所有视觉参数
+        for param in self.blip_vision.parameters():
             param.requires_grad = False 
+
+        # 【核心修改】：配置文件控制 BLIP LoRA
+        use_blip_lora = args.get('use_blip_lora', True)
+        if use_blip_lora:
+            peft_config_blip = LoraConfig(
+                r=16, lora_alpha=32, lora_dropout=0.05,
+                # 适配 BLIP (ViT) 架构的关键层
+                target_modules=["qkv", "query", "key", "value", "dense", "projection"] 
+            )
+            self.blip_vision = get_peft_model(self.blip_vision, peft_config_blip)
+            print("=> BLIP Vision LoRA is ENABLED.")
+            self.blip_vision.print_trainable_parameters()
+        else:
+            print("=> BLIP Vision LoRA is DISABLED.")
             
         # 实例化原生 Q-Former
         self.qformer = NativeTextConditionedQFormer(
-            vision_dim=self.blip2.config.vision_config.hidden_size, # 通常为 1408
-            text_dim=hidden_size, # Qwen 词向量维度: 3584
+            vision_dim=self.blip_vision.config.hidden_size, # BLIP 通常为 768
+            text_dim=hidden_size, 
             embed_dim=768, 
-            out_dim=hidden_size,  # 输出对齐 LLM: 3584
+            out_dim=hidden_size,  
             num_queries=32,       
             num_layers=4          
         ).to(torch.bfloat16)
@@ -237,17 +242,16 @@ class T2VQA(nn.Module):
         video_aesthetic = data.get('video_aesthetic', video)
 
         # ==========================================================
-        # 1. 空间语义分支 (原生文本引导 Q-Former)
+        # 1. 空间语义分支 (原生 BLIP Vision)
         # ==========================================================
         frames = video.transpose(1, 2).reshape(B * T, C, H, W)
-        frames = frames.to(self.blip2.dtype) 
+        frames = frames.to(self.blip_vision.dtype) 
         
-        # A. 提取视觉特征 (无梯度)
-        with torch.no_grad():
-            vision_outputs = self.blip2.vision_model(pixel_values=frames)
-            image_embeds = vision_outputs[0] # [B*T, num_patches, 1408]
+        # A. 提取视觉特征（如果开启 LoRA，这里需要计算梯度，故移除 no_grad）
+        vision_outputs = self.blip_vision(pixel_values=frames)
+        image_embeds = vision_outputs.last_hidden_state # [B*T, num_patches, 768]
             
-        # B. 准备文本条件 (只传 caption，复用 Qwen 的 Tokenizer 和 Embedding)
+        # B. 准备文本条件
         expanded_captions = [cap for cap in caption for _ in range(T)]
         text_inputs = self.llm_tokenizer(
             expanded_captions, 
@@ -257,49 +261,44 @@ class T2VQA(nn.Module):
             return_tensors="pt"
         ).to(device)
 
-        # 核心技巧：提取高质量 Qwen 静态词向量作为文本特征
         with torch.no_grad():
-            text_feats = self.llm_model.get_input_embeddings()(text_inputs.input_ids) # [B*T, seq_len, 3584]
+            text_feats = self.llm_model.get_input_embeddings()(text_inputs.input_ids)
 
-        # C. 多模态交互 (传入视觉特征、文本特征和文本掩码)
+        # C. 多模态交互
         qformer_out = self.qformer(
             vision_feats=image_embeds.to(text_feats.dtype),
             text_feats=text_feats,
             text_mask=text_inputs.attention_mask
-        ) # 输出: [B*T, 32, 3584]
+        ) 
         
         # D. 提取输出并浓缩语义
-        # 对 32 个 Query 求均值，代表每一帧浓缩后的语义特征
-        frame_semantic = qformer_out.mean(dim=1) # [B*T, 3584]
-
-        # 恢复时序维度 (直接已经是 3584 维，完美匹配 Qwen，不再需要旧代码的投影层)
-        semantic_embeds = frame_semantic.view(B, T, -1) # [B, T, 3584]
+        frame_semantic = qformer_out.mean(dim=1) 
+        semantic_embeds = frame_semantic.view(B, T, -1) 
 
         # ==========================================================
         # 2. 运动分支 (SlowFast)
         # ==========================================================
         sf_input = self.prepare_slowfast_input(video)
-        pooled_motion = self.slowfast(sf_input) # [B, 2304, T, 1, 1]
+        pooled_motion = self.slowfast(sf_input) 
         
-        motion_tokens = pooled_motion.flatten(2).transpose(1, 2) # [B, T, 2304]
-        motion_embeds = self.motion_proj(motion_tokens) # [B, T, 3584]
+        motion_tokens = pooled_motion.flatten(2).transpose(1, 2) 
+        motion_embeds = self.motion_proj(motion_tokens) 
 
         # ==========================================================
         # 3. 美学分支 (ConvNeXt)
         # ==========================================================
         aes_features = self.aesthetic_conv3d(video_aesthetic) 
-        pooled_aes = self.aesthetic_pool(aes_features) # [B, 768, T, 1, 1]
+        pooled_aes = self.aesthetic_pool(aes_features) 
         
-        aesthetic_tokens = pooled_aes.flatten(2).transpose(1, 2) # [B, T, 768]
-        aesthetic_embeds = self.aesthetic_proj(aesthetic_tokens) # [B, T, 3584]
+        aesthetic_tokens = pooled_aes.flatten(2).transpose(1, 2) 
+        aesthetic_embeds = self.aesthetic_proj(aesthetic_tokens) 
 
         # ==========================================================
         # 4. Token 拼接与 Qwen 输入对齐
         # ==========================================================
-        multimodal_embeds = torch.cat([motion_embeds, aesthetic_embeds, semantic_embeds], dim=1) # [B, 3*T, 3584]
+        multimodal_embeds = torch.cat([motion_embeds, aesthetic_embeds, semantic_embeds], dim=1) 
         atts_multimodal = torch.ones(multimodal_embeds.size()[:-1], dtype=torch.long).to(device)
 
-        # 拼接提供给最终 LLM 判断的 prompt
         full_prompt = [f"Context: {cap}. {prompt}" for cap in caption] if isinstance(caption, list) else [f"Context: {caption}. {prompt}"] * B
         
         llm_tokens = self.llm_tokenizer(
@@ -344,7 +343,9 @@ if __name__=="__main__":
     mock_args = {
         'clip_len': 8,
         'llm_model': 'Qwen/Qwen2.5-7B-Instruct', 
-        'clip_weights': 'openai/clip-vit-large-patch14',
+        'blip_weights': 'Salesforce/blip-image-captioning-base',
+        'use_blip_lora': True,
+        'use_llm_lora': False,
     }
     
     model = T2VQA(args=mock_args).to(device)
@@ -355,6 +356,5 @@ if __name__=="__main__":
     video = torch.randn(2, 3, 8, 224, 224).to(device)
     data = {'video': video}
 
-    with torch.no_grad():
-        output = model(data, caption, prompt)
+    output = model(data, caption, prompt)
     print("Predicted Scores:", output)

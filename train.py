@@ -81,7 +81,7 @@ def finetune_epoch(
     for i, data in enumerate(tqdm(ft_loader, desc=f"Training in epoch {epoch}")):
         optimizer.zero_grad()
         
-        # 组装传入 model 的数据字典，确保适配重构后 model.py 要求的设备存放
+        # 组装传入 model 的数据字典
         inputs = {}
         inputs["video"] = data["video"].to(device)
         if "video_aesthetic" in data:
@@ -167,7 +167,7 @@ def inference_set(
                     or "aesthetic_proj" in key
                     or "slowfast" in key
                     or "aesthetic_conv3d" in key
-                    or "lora" in key # 【新增】：保存模型时带上 LoRA 权重
+                    or "lora" in key # 捕获 BLIP 和 Qwen 的所有 LoRA 权重
                 ):
                     head_state_dict[key] = v
             print("Following keys are saved (for head-only):", head_state_dict.keys())
@@ -273,14 +273,12 @@ def main():
                 pin_memory=True,
             )
 
-        # 修改：精确解耦参数组，针对三分支架构 + LoRA
-        # 修改：精确解耦参数组
+        # 【核心修改】：精确解耦参数组，针对三分支架构 + 双 LoRA 控制
         param_groups = []   
         for name, param in model.named_parameters():
             if (
-                "qformer" in name          # 捕获 BLIP-2 Q-Former 的 LoRA
-                or "semantic_proj" in name # 捕获映射层
-                or "lora" in name          # 捕获 Qwen 的 LoRA
+                "qformer" in name          # 捕获 原生 Q-Former
+                or "lora" in name          # 捕获 BLIP 和 Qwen 可能存在的 LoRA 参数
                 or "motion_proj" in name
                 or "aesthetic_proj" in name
                 or "slowfast" in name
@@ -357,9 +355,8 @@ def main():
             with open(f"training_history_split{split}.json", "w", encoding="utf-8") as f:
                 json.dump(history_log, f, indent=4)
             
-        # 修改：训练结束后如果有需要解锁的操作
         for key, value in dict(model.named_children()).items():
-            if "proj" in key or "slowfast" in key or "aesthetic_conv3d" in key or "qformer" in key: # 加入 qformer
+            if "proj" in key or "slowfast" in key or "aesthetic_conv3d" in key or "qformer" in key:
                 for param in value.parameters():
                     param.requires_grad = True
 

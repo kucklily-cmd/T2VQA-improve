@@ -2,7 +2,7 @@ name: T2VQA
 num_epochs: 30
 warmup_epochs: 2.5
 save_model: true
-batch_size: 8
+batch_size: 2
 num_workers: 8
 split_seed: 1
 
@@ -54,7 +54,9 @@ model:
       
         aesthetic_weights: /data/TeamMember/lm/sy/project/models/COVER.pth 
         
-        blip2_model: /home/sy/.cache/modelscope/hub/models/Salesforce/blip2-opt-2.7b
+        blip_weights: /data/TeamMember/lm/sy/project/models/model_large-002.pth
+        use_blip_lora: false
+        use_llm_lora: false
             
 optimizer:
     lr: !!float 1e-5
