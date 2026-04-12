@@ -1,53 +1,35 @@
-import contextlib
-from transformers import LlamaForCausalLM, LlamaTokenizer, BertModel
-
 import torch
 from torch import nn
-import torch.nn.functional as F
+import contextlib
 from collections import OrderedDict
 
-import copy
+# 引入 HuggingFace 新版核心库
+from transformers import (
+    AutoTokenizer, 
+    AutoModelForCausalLM, 
+    Blip2Model, 
+    Blip2Processor,
+    BertModel,           
+    BertTokenizer        
+)
+# 引入 LoRA 微调库
+from peft import LoraConfig, get_peft_model, TaskType
 
-#from model.attention import Transformer3DModel
-from model.blip import create_vit, init_tokenizer, load_checkpoint
-from model.blip_pretrain import BLIP_Pretrain
-from model.swin import swin_3d_tiny, SwinTransformer3D, SwinTransformer2D
+# 导入你原有的视觉主干网络
+from model.swin import swin_3d_tiny
 from model.conv_backbone import convnext_3d_tiny
 
-
-from torch.nn import TransformerDecoderLayer, TransformerDecoder
-from timm.models.vision_transformer import vit_base_patch16_224
-
-
-
-def _get_clones(module, N):
-    return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
-
-def zero_module(module):
-    for p in module.parameters():
-        p.detach().zero_()
-    return module
-
-
-
-def disabled_train(self, mode=True):
-    """Overwrite model.train with this function to make sure train/eval mode
-    does not change anymore."""
-    return self
-
+# ==========================================
+# 基础池化与融合模块
+# ==========================================
 class CrossAttentionPooling(nn.Module):
     def __init__(self, text_dim, visual_dim, embed_dim, num_heads=8):
         super().__init__()
-        # 将文本特征投影为 Query
         self.q_proj = nn.Linear(text_dim, embed_dim)
-        # 将视觉时空 Token 投影为 Key 和 Value
         self.k_proj = nn.Linear(visual_dim, embed_dim)
         self.v_proj = nn.Linear(visual_dim, embed_dim)
-        
         self.attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
         self.norm1 = nn.LayerNorm(embed_dim)
-        
-        # 前馈网络 (FFN) 增加非线性表达能力
         self.ffn = nn.Sequential(
             nn.Linear(embed_dim, embed_dim * 4),
             nn.GELU(),
@@ -56,45 +38,23 @@ class CrossAttentionPooling(nn.Module):
         self.norm2 = nn.LayerNorm(embed_dim)
 
     def forward(self, text_feat, visual_tokens):
-        """
-        text_feat: [B, text_dim] (Semantic Anchor)
-        visual_tokens: [B, T*H*W, visual_dim] (Unpooled 3D features)
-        """
-        # [B, text_dim] -> [B, 1, embed_dim]
         q = self.q_proj(text_feat).unsqueeze(1) 
-        # [B, T*H*W, visual_dim] -> [B, T*H*W, embed_dim]
         k = self.k_proj(visual_tokens)
         v = self.v_proj(visual_tokens)
-        
-        # 交叉注意力计算
-        attn_out, _ = self.attn(q, k, v)  # 输出形状: [B, 1, embed_dim]
-        
-        # 残差连接与归一化
+        attn_out, _ = self.attn(q, k, v)
         out = self.norm1(q + attn_out)
         ffn_out = self.ffn(out)
         out = self.norm2(out + ffn_out)
-        
-        # 去掉序列维度，返回池化后的对齐特征: [B, embed_dim]
         return out.squeeze(1)
+
 class GateMixer(nn.Module):
-    def __init__(
-        self,
-        v_in_dim,
-        c_in_dim,
-        text_dim,  # 新增文本特征维度
-        d,
-        token_len=32,
-        prefix_len=8,
-        out_dim=None,
-    ):
+    def __init__(self, v_in_dim, c_in_dim, text_dim, d, token_len=32, prefix_len=8, out_dim=None):
         super().__init__()
         self.token_len = token_len
         self.prefix_len = prefix_len
         self.w1_v = nn.Linear(v_in_dim, d)
         self.w1_c = nn.Linear(c_in_dim, d)
-        # 门控全连接层现在接收：Swin特征(d) + Conv特征(d) + 文本特征(text_dim)
         self.w_g = nn.Linear(2 * d + text_dim, d) 
-        
         if prefix_len > 0:
             self.h_p = nn.Parameter(torch.zeros(1, prefix_len, d))
             nn.init.normal_(self.h_p, mean=0.0, std=0.02)
@@ -105,11 +65,8 @@ class GateMixer(nn.Module):
     def forward(self, v_v, v_c, text_feat):
         h_v = self.w1_v(v_v).unsqueeze(1).expand(-1, self.token_len, -1)
         h_c = self.w1_c(v_c).unsqueeze(1).expand(-1, self.token_len, -1)
-        
-        # 将文本特征也扩展到序列长度参与门控计算
         text_feat_exp = text_feat.unsqueeze(1).expand(-1, self.token_len, -1)
         
-        # 模型现在可以根据 Prompt 决定倾向于全局结构还是局部纹理
         alpha_v = torch.sigmoid(self.w_g(torch.cat([h_v, h_c, text_feat_exp], dim=-1)))
         h = (1 - alpha_v) * h_v + alpha_v * h_c
         
@@ -117,322 +74,277 @@ class GateMixer(nn.Module):
             h = torch.cat([self.h_p.expand(h.size(0), -1, -1), h], dim=1)
         return self.w2(h)
 
-class T2VQA(nn.Module):
-    # python的属性字段在init函数声明，self.xx = xx
-    def __init__(self,
-                 args):
+# ==========================================
+# 重构核心模型 (LLaMA-3 + BLIP-2 + BERT + 双路 LoRA)
+# ==========================================
+class T2VQA_Llama3_Blip2(nn.Module):
+    def __init__(self, args):
         super().__init__()
-    
-        # ---------- 基础配置 ----------
-        # 读取配置参数
-        med_config = args['med_config']
-        image_size = args['image_size']
-        embed_dim = args['embed_dim']#不同模态嵌入维度
-        llm_model = args['llm_model']
-
-        # ---------- 视觉-文本编码器（BLIP） ----------
-        # 这里用 BLIP 的 text_encoder 读取 caption，并通过 cross-attn 融合每帧的视觉 token
-        self.blip = BLIP_Pretrain(image_size = image_size, vit = 'large', embed_dim = embed_dim, med_config = med_config)
-        # 反序列化python对象，加载 BLIP 预训练权重
-        state_dict = torch.load(args['blip_weights'], map_location='cpu')
-
-        # 将state_dict的内容键张量对加载到模型里面的对应参数，模型有关参数在model键下，False表示不严格匹配
-        self.blip.load_state_dict(state_dict["model"], strict=False)
-
-        for name, param in self.blip.named_parameters():
-            if ("text_encoder" in name):
-                # 是否计算梯度，反向传播是否更新
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
-
-        # 把 BLIP text_encoder 输出投到 embed_dim（后续作为多帧语义 token）
-        self.finetune_text_proj = nn.Linear(self.blip.text_encoder.config.hidden_size, embed_dim)
-        # 新增一个纯文本编码器提取语义锚点
-        # 加载标准的 bert-base-uncased，默认 add_cross_attention 是 False
-        self.pure_text_encoder = BertModel.from_pretrained(args['bert_weights'])
         
-        # 冻结这个纯文本编码器（视显存情况而定，建议冻结）
+        embed_dim = args.get('embed_dim', 256)
+        llm_model_path = args['llm_model'] 
+        blip2_model_path = args.get('blip2_model', "Salesforce/blip2-opt-2.7b")
+        bert_model_path = args.get('bert_weights', 'bert-base-uncased')
+        
+        # -----------------------------------------------------------
+        # 1. 视觉编码器 (BLIP-2)
+        # -----------------------------------------------------------
+        self.blip2_processor = Blip2Processor.from_pretrained(blip2_model_path)
+        self.blip2 = Blip2Model.from_pretrained(blip2_model_path, torch_dtype=torch.float16)
+        
+        # --- 动态控制视觉编码器 (ViT) 的 LoRA 微调 ---
+        self.use_vision_lora = args.get('use_vision_lora', False)
+        
+        if self.use_vision_lora:
+            print("=> 启用 LoRA 进行 视觉编码器 (ViT) 微调...")
+            vision_lora_r = args.get('vision_lora_r', 16)
+            vision_lora_alpha = args.get('vision_lora_alpha', 32)
+            vision_lora_dropout = args.get('vision_lora_dropout', 0.05)
+            
+            # 使用 PEFT 包装 BLIP-2 的 Vision Model 部分
+            vision_peft_config = LoraConfig(
+                r=vision_lora_r,
+                lora_alpha=vision_lora_alpha,
+                lora_dropout=vision_lora_dropout,
+                # 适配 BLIP-2 ViT 中典型线性层的名称
+                target_modules=["qkv", "projection", "dense"] 
+            )
+            self.blip2.vision_model = get_peft_model(self.blip2.vision_model, vision_peft_config)
+            self.blip2.vision_model.print_trainable_parameters()
+        else:
+            print("=> 禁用视觉 LoRA。BLIP-2 的视觉主干网络将被完全冻结。")
+            for param in self.blip2.vision_model.parameters():
+                param.requires_grad = False
+                
+        # Q-Former 桥接层参数量适中，通常全参微调以学习新的图文对齐关系
+        for param in self.blip2.qformer.parameters():
+            param.requires_grad = True
+
+        blip2_hidden_size = self.blip2.config.qformer_config.hidden_size # 通常为 768
+
+        # -----------------------------------------------------------
+        # 2. 纯文本编码器 (BERT - 专用于提取 GateMixer 的锚点)
+        # -----------------------------------------------------------
+        self.bert_tokenizer = BertTokenizer.from_pretrained(bert_model_path)
+        self.pure_text_encoder = BertModel.from_pretrained(bert_model_path)
+        
+        # 彻底冻结 BERT，它只提供纯文本语义，不参与训练更新，极省显存
         for param in self.pure_text_encoder.parameters():
             param.requires_grad = False
-
-        # ---------- 语言模型（LLM） ----------
-        # LLM 本体冻结，仅用作“把多模态 token + 文本 prompt”映射到质量词的 logits
-        self.llm_tokenizer = LlamaTokenizer.from_pretrained(llm_model, use_fast=False)
-        self.llm_model = LlamaForCausalLM.from_pretrained(
-            llm_model, torch_dtype=torch.float16
-        )
-        # 设置词表
-        # 特殊标记的添加时为了确保LLM可以正确处理输入序列，开始结束和词汇表外的词汇
-        self.llm_tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-        self.llm_tokenizer.add_special_tokens({'bos_token': '</s>'})
-        self.llm_tokenizer.add_special_tokens({'eos_token': '</s>'})
-        self.llm_tokenizer.add_special_tokens({'unk_token': '</s>'})
-
-        #添加新标记的时候同时拓展词嵌入层
-        self.llm_model.resize_token_embeddings(len(self.llm_tokenizer))
-
-        llm_safetensors_index = args.get("llm_safetensors_index", None)
-        if llm_safetensors_index:
-            self._load_llm_from_safetensors_index(
-                llm_safetensors_index,
-                prefix_to_strip=args.get("llm_safetensors_prefix_to_strip", "llm."),
-            )
-
-        self.finetune_semantic_proj = nn.Linear(embed_dim, self.llm_model.config.hidden_size)
-        self.finetune_fidelity_proj = nn.Linear(embed_dim, self.llm_model.config.hidden_size)
-        
-        #保证llm在训练过程中不变化
-        for name, param in self.llm_model.named_parameters():#获取里面所有变量（模型参数nn.Parameter）
-                param.requires_grad = False#关闭梯度
-        self.llm_model = self.llm_model.eval()
-        self.llm_model.train = disabled_train
-
-        # 最终从 LLM 的 vocab logits 中取这 5 个词的打分
-        # 词表中五个单词转换为数字列表
-        self.excellent_idx, self.good_idx, self.fair_idx, self.poor_idx, self.bad_idx = self.llm_tokenizer(["excellent", "good","fair", "poor", "bad"])['input_ids']
-        self.excellent_idx = self.excellent_idx[1]
-        self.good_idx = self.good_idx[1]
-        self.fair_idx = self.fair_idx[1]
-        self.poor_idx = self.poor_idx[1]
-        self.bad_idx = self.bad_idx[1]
-
-        # ---------- 技术质量分支（Swin3D） ----------
-        # 用 3D Swin 从视频 clip 中抽取技术质量/时空结构表征，并扩展成固定长度的 query token（32）
-        self.swin3d = swin_3d_tiny()
-        state_dict = torch.load(args['swin_weights'], map_location='cpu')
-        state_dict = state_dict['state_dict']
-        
-        #我的状态字典，有序状态字典
-        # 传入状态字典可以和我的模型名字对齐
-        i_state_dict = OrderedDict()
-        for key in state_dict.keys():
-            if "head" in key:
-                continue
-            if "cls" in key:
-                tkey = key.replace("cls", "vqa")
-            elif "backbone" in key:
-                tkey = key.replace("backbone.", "")
-                i_state_dict[tkey] = state_dict[key]
-            else:
-                i_state_dict[key] = state_dict[key]
             
-        print(self.swin3d.load_state_dict(i_state_dict, strict=False))
-        
-        #自适应平均池化，指定输出的尺寸
-        # self.swin_avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        text_hidden_size = self.pure_text_encoder.config.hidden_size # 通常为 768
 
-        self.conv3d = convnext_3d_tiny(
-            pretrained=args.get("conv_pretrained", False),
-            in_22k=args.get("conv_in_22k", False),
-            checkpoint=args.get("conv_weights", None),
-        )
-        # self.conv_avg_pool = nn.AdaptiveAvgPool3d((1, 1, 1))
+        # -----------------------------------------------------------
+        # 3. 技术质量分支 (Swin3D + Conv3D)
+        # -----------------------------------------------------------
+        self.swin3d = swin_3d_tiny()
+        if args.get('swin_weights'):
+            state_dict = torch.load(args['swin_weights'], map_location='cpu')['state_dict']
+            i_state_dict = OrderedDict({k.replace("backbone.", ""): v for k, v in state_dict.items() if "head" not in k})
+            self.swin3d.load_state_dict(i_state_dict, strict=False)
+            
+        self.conv3d = convnext_3d_tiny(checkpoint=args.get("conv_weights", None))
 
-        # 新增交叉注意力池化器 (假设 Swin3D 和 ConvNext3D 输出通道都是 768)
-        text_hidden_size = self.blip.text_encoder.config.hidden_size
+        # 交叉注意力池化器 (输入维度改为 BERT 的维度)
         self.swin_attn_pool = CrossAttentionPooling(text_dim=text_hidden_size, visual_dim=768, embed_dim=embed_dim)
         self.conv_attn_pool = CrossAttentionPooling(text_dim=text_hidden_size, visual_dim=768, embed_dim=embed_dim)
 
         self.gate_mixer = GateMixer(
-            v_in_dim=embed_dim,    # 注意这里改为了 embed_dim，因为 attn_pool 输出是 embed_dim
-            c_in_dim=embed_dim,    
-            text_dim=text_hidden_size, # 传入文本维度
-            d=embed_dim,
-            token_len=args.get("gatemixer_token_len", 32),
-            prefix_len=args.get("gatemixer_prefix_len", 8),
-            out_dim=embed_dim,
+            v_in_dim=embed_dim, c_in_dim=embed_dim, text_dim=text_hidden_size, d=embed_dim,
+            token_len=32, prefix_len=8, out_dim=embed_dim
         )
 
-        # 将 5 个等级映射到数值权重（1~5），用于把 5 个词的概率加权成最终分数
+        # -----------------------------------------------------------
+        # 4. 语言模型 (LLaMA-3) 与 动态 LoRA 微调
+        # -----------------------------------------------------------
+        self.llm_tokenizer = AutoTokenizer.from_pretrained(llm_model_path, padding_side="left")
+        if self.llm_tokenizer.pad_token is None:
+            self.llm_tokenizer.pad_token = self.llm_tokenizer.eos_token
+
+        self.llm_model = AutoModelForCausalLM.from_pretrained(
+            llm_model_path, 
+            torch_dtype=torch.float16,
+            device_map="auto"
+        )
+        
+        # 冻结 LLaMA-3 的所有基础参数
+        for param in self.llm_model.parameters():
+            param.requires_grad = False
+            
+        # 读取配置文件中的 LLM LoRA 设置
+        self.use_lora = args.get('use_lora', True)
+        
+        if self.use_lora:
+            print("=> 启用 LoRA 进行 大语言模型 (LLM) 微调...")
+            lora_r = args.get('lora_r', 16)
+            lora_alpha = args.get('lora_alpha', 32)
+            lora_dropout = args.get('lora_dropout', 0.05)
+            
+            peft_config = LoraConfig(
+                task_type=TaskType.CAUSAL_LM, 
+                inference_mode=False, 
+                r=lora_r, 
+                lora_alpha=lora_alpha, 
+                lora_dropout=lora_dropout,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+            )
+            self.llm_model = get_peft_model(self.llm_model, peft_config)
+            self.llm_model.print_trainable_parameters() 
+        else:
+            print("=> 禁用大语言模型 LoRA。LLM 的所有参数将被冻结。")
+
+        # -----------------------------------------------------------
+        # 5. 模态对齐投影层 (Projection Layers)
+        # -----------------------------------------------------------
+        llm_hidden_size = self.llm_model.config.hidden_size
+        self.finetune_semantic_proj = nn.Linear(blip2_hidden_size, llm_hidden_size)
+        self.finetune_fidelity_proj = nn.Linear(embed_dim, llm_hidden_size)
+
+        # -----------------------------------------------------------
+        # 6. 质量预测分数 Logits 提取
+        # -----------------------------------------------------------
+        target_words = [" excellent", " good", " fair", " poor", " bad"]
+        self.quality_ids = []
+        for word in target_words:
+            tokens = self.llm_tokenizer(word, add_special_tokens=False).input_ids
+            self.quality_ids.append(tokens[-1]) 
+        
         self.weights = torch.Tensor([[1], [2], [3], [4], [5]])
 
-
-    def quality_regression(self,in_channels, middle_channels, out_channels):
-        regression_block = nn.Sequential(
-            nn.Linear(in_channels, middle_channels),
-            nn.Linear(middle_channels, out_channels),          
-        )
-
-        return regression_block
-
-
+    @property
     def device(self):
-        return list(self.parameters())[0].device
+        return next(self.parameters()).device
 
     def maybe_autocast(self, dtype=torch.float16):
-        # if on cpu, don't use autocast
-        # if on gpu, use autocast with dtype if provided, otherwise use torch.float16
-        enable_autocast = self.device != torch.device("cpu")
-
-        if enable_autocast:
-            return torch.cuda.amp.autocast(dtype=dtype)
+        if self.device.type != "cpu":
+            return torch.amp.autocast('cuda', dtype=dtype)
         else:
             return contextlib.nullcontext()
 
-    def _load_llm_from_safetensors_index(self, index_json_path: str, prefix_to_strip: str = "llm."):
-        import json
-        import os
-
-        try:
-            from safetensors.torch import load_file
-        except Exception as e:
-            raise ModuleNotFoundError(
-                "Missing dependency `safetensors`. Install it to load *.safetensors shards."
-            ) from e
-
-        with open(index_json_path, "r", encoding="utf-8") as f:
-            index = json.load(f)
-        weight_map = index.get("weight_map", {})
-        shard_to_keys = {}
-        for k, shard_name in weight_map.items():
-            if prefix_to_strip and not k.startswith(prefix_to_strip):
-                continue
-            shard_to_keys.setdefault(shard_name, []).append(k)
-
-        base_dir = os.path.dirname(index_json_path)
-        remapped_state = {}
-        for shard_name, keys in shard_to_keys.items():
-            shard_path = os.path.join(base_dir, shard_name)
-            if not os.path.exists(shard_path):
-                raise FileNotFoundError(f"Missing shard file: {shard_path}")
-            shard_state = load_file(shard_path, device="cpu")
-            for k in keys:
-                new_k = k[len(prefix_to_strip):] if prefix_to_strip else k
-                if k in shard_state:
-                    remapped_state[new_k] = shard_state[k]
-
-        self.llm_model.load_state_dict(remapped_state, strict=False)
-
     def forward(self, data, caption, prompt):
-        video = data['video']
+        video = data['video'] # [B, C, T, H, W]
+        B, C, T, H, W = video.shape
+        device = video.device
 
-        # 1. 优先获取全局纯文本特征作为 Semantic Anchor
-        text = self.blip.tokenizer(caption, padding='max_length', truncation=True, max_length=35, return_tensors="pt").to(video.device)
+        # ==========================================
+        # Step 1: 语义与视觉特征提取
+        # ==========================================
         
-        # BLIP text_encoder 不传 encoder_hidden_states 时充当纯文本编码器
-        # 使用专门的纯文本编码器提取
-        text_output = self.pure_text_encoder(text.input_ids, attention_mask=text.attention_mask, return_dict=True)
-        global_text_feat = text_output.last_hidden_state[:, 0, :] # [B, text_dim]
-
-        # 2. 技术质量特征：用 Cross-Attention Pooling 替代 AvgPool 展平
-        f_swin = self.swin3d(video) # 原始形状: [B, C, T, H, W]
-        B, C_s, T_s, H_s, W_s = f_swin.shape
-        # 展平为 [B, T*H*W, C] 
-        f_swin_flat = f_swin.view(B, C_s, -1).transpose(1, 2) 
-        # 文本引导对齐
-        pooled_swin = self.swin_attn_pool(global_text_feat, f_swin_flat) # [B, embed_dim]
-
-        f_conv = self.conv3d(video) # 原始形状: [B, C, T, H, W]
-        B, C_c, T_c, H_c, W_c = f_conv.shape
-        # 展平为 [B, T*H*W, C]
-        f_conv_flat = f_conv.view(B, C_c, -1).transpose(1, 2)
-        # 文本引导对齐
-        pooled_conv = self.conv_attn_pool(global_text_feat, f_conv_flat) # [B, embed_dim]
-
-        # 3. 文本条件引导的 GateMixer
-        # inputs_swin 此时包含高度对齐的时空技术质量 tokens
-        inputs_swin = self.gate_mixer(pooled_swin, pooled_conv, global_text_feat)
+        # 1.1 使用 BERT 提取纯文本的全局特征 (Semantic Anchor)
+        text_inputs = self.bert_tokenizer(
+            caption, padding='max_length', truncation=True, max_length=35, return_tensors="pt"
+        ).to(device)
         
-        # ... 后续保留你原有的多帧语义 Token 提取和 LLM 逻辑不变 ...
-        atts_swin = torch.ones(inputs_swin.size()[:-1], dtype=torch.long).to(video.device)
+        with torch.no_grad(): 
+            text_outputs = self.pure_text_encoder(
+                input_ids=text_inputs.input_ids,
+                attention_mask=text_inputs.attention_mask,
+                return_dict=True,
+            )
+        global_text_feat = text_outputs.last_hidden_state[:, 0, :] # [B, text_dim]
 
-        inputs_llm = []
+        # 1.2 准备 BLIP-2 视频输入，按帧拉平
+        video_flat = video.permute(0, 2, 1, 3, 4).reshape(B * T, C, H, W)
 
-        #人类能看懂的句子（caption）转换成模型能处理的数字矩阵（Tokens），并统一所有句子的长度。
-        #将字符串拆分成“词元”（Tokens）。例如把 "A cat is running" 拆解并映射为词表中的索引数字，如 [101, 134, 567, ...]。
-        text = self.blip.tokenizer(caption, padding='max_length', truncation=True, max_length=35, 
-                                  return_tensors="pt").to(video.device)
-        
-        # ---------- 多帧语义 token（逐帧：视觉 encoder + text_encoder cross-attn） ----------
-        # 这个video是数据加载器封装的五个维度的那个
-        for j in range(video.size(2)):#size（2）获取第三个维度的内容
-            #遍历每一帧
-            image = video[:,:,j,:,:]
-
-            image_embeds = self.blip.visual_encoder(image)
-
-            # 给图像 embedding 构造一个 全1的 attention mask
-            image_atts = torch.ones(image_embeds.size()[:-1],dtype=torch.long).to(video.device)
-
-            # 交叉注意力机制
-            output = self.blip.text_encoder(text.input_ids,
-                                                attention_mask = text.attention_mask,
-                                                encoder_hidden_states = image_embeds,
-                                                encoder_attention_mask = image_atts,
-                                                return_dict = True,
-                                            )
-
-            # 取 [CLS] 作为该帧的语义摘要 token
-            output = self.finetune_text_proj(output.last_hidden_state[:,0,:])
-
-
-            inputs_llm.append(output)
-
-        semantic_tokens = torch.stack(inputs_llm, dim=1)
-        semantic_tokens = self.finetune_semantic_proj(semantic_tokens)
-        fidelity_tokens = self.finetune_fidelity_proj(inputs_swin)
-
-        inputs_llm = torch.cat([fidelity_tokens, semantic_tokens], dim=1)
-        atts_llm = torch.ones(inputs_llm.size()[:-1], dtype=torch.long).to(video.device)
-
-        
-        # LLM提示词转换为数字矩阵
-        llm_tokens = self.llm_tokenizer(
-        # ---------- 文本提示词 token（prompt） ----------
-            [prompt] * video.size(0),# 将同一个字符串 prompt 重复B次，组成一个列表。
-            padding="longest",# 自动补长
-            return_tensors="pt"# 返回pt张量
-        ).to(video.device)
-
-        # 是否开启混合精度
         with self.maybe_autocast():
-            # 调用 LLM 自带的嵌入层（Embedding Layer），将之前生成的数字编号（input_ids）映射为高维稠密向量。
-            inputs_embeds = self.llm_model.get_input_embeddings()(llm_tokens.input_ids)
+            qformer_features = self.blip2.get_qformer_features(pixel_values=video_flat)
             
-            # 将 Token (inputs_llm) 拼在文本 Token (inputs_embeds) 的前面
-            inputs_embeds = torch.cat([inputs_llm.to(dtype=inputs_embeds.dtype), inputs_embeds], dim=1)
+        # Q-Former 输出: [B*T, num_query_tokens(32), blip2_hidden_size(768)]
+        frame_semantic_tokens = qformer_features.mean(dim=1) # [B*T, 768]
+        frame_semantic_tokens = frame_semantic_tokens.view(B, T, -1) # [B, T, 768]
+
+        # ==========================================
+        # Step 2: 技术质量分支提取
+        # ==========================================
+        with self.maybe_autocast():
+            f_swin = self.swin3d(video) 
+            f_conv = self.conv3d(video) 
             
-            #同样在序列维度（dim=1）上，将视觉部分的“全 1 掩码”和文本部分的“填充掩码”拼在一起。
-            attention_mask = torch.cat([atts_llm, llm_tokens.attention_mask], dim=1)
+        f_swin_flat = f_swin.view(B, f_swin.shape[1], -1).transpose(1, 2) 
+        f_conv_flat = f_conv.view(B, f_conv.shape[1], -1).transpose(1, 2)
+        
+        pooled_swin = self.swin_attn_pool(global_text_feat, f_swin_flat) 
+        pooled_conv = self.conv_attn_pool(global_text_feat, f_conv_flat) 
+
+        # GateMixer 融合
+        inputs_swin = self.gate_mixer(pooled_swin, pooled_conv, global_text_feat) # [B, len, embed_dim]
+
+        # ==========================================
+        # Step 3: LLM 投影与拼接
+        # ==========================================
+        semantic_embeds = self.finetune_semantic_proj(frame_semantic_tokens) # [B, T, llm_dim]
+        fidelity_embeds = self.finetune_fidelity_proj(inputs_swin)           # [B, len, llm_dim]
+
+        visual_inputs_embeds = torch.cat([fidelity_embeds, semantic_embeds], dim=1)
+        visual_atts = torch.ones(visual_inputs_embeds.size()[:-1], dtype=torch.long).to(device)
+
+        if isinstance(prompt, str):
+            prompt = [prompt] * B 
+
+        prompt_texts = [f"<|start_header_id|>user<|end_header_id|>\n\n{p}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nThe quality of this video is " for p in prompt]
+        
+        llm_tokens = self.llm_tokenizer(
+            prompt_texts, padding="longest", return_tensors="pt", add_special_tokens=False
+        ).to(device)
+
+        with self.maybe_autocast():
+            if self.use_lora:
+                text_inputs_embeds = self.llm_model.get_base_model().get_input_embeddings()(llm_tokens.input_ids)
+            else:
+                text_inputs_embeds = self.llm_model.get_input_embeddings()(llm_tokens.input_ids)
+            
+            inputs_embeds = torch.cat([visual_inputs_embeds, text_inputs_embeds], dim=1)
+            attention_mask = torch.cat([visual_atts, llm_tokens.attention_mask], dim=1)
 
             outputs = self.llm_model(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+            )
 
-                )
-        # 从 LLM 的输出中取 最后一个 Token（即提示词结束后的第一个预测位）的 Logits
-        output_logits = outputs.logits[:, -1]
+        # ==========================================
+        # Step 4: 质量分数回归
+        # ==========================================
+        output_logits = outputs.logits[:, -1, :] 
+        
+        q_logits = output_logits[:, self.quality_ids] # [B, 5]
+        q_pred = (q_logits / 100).softmax(dim=-1)     # [B, 5]
+        
+        weights_device = self.weights.to(device, dtype=q_pred.dtype)
+        score = torch.matmul(q_pred, weights_device).squeeze(-1) # [B]
 
-        # 拥有几万个词的概率分布中，精准挑出你最开始获取的那 5 个索引（excellent, good 等）对应的数值。
-        lexcellent, lgood, lfair, lpoor, lbad = output_logits[:, self.excellent_idx], output_logits[:, self.good_idx], output_logits[:, self.fair_idx], output_logits[:,self.poor_idx], output_logits[:, self.bad_idx]
-
-        #归一化
-        q_pred = (torch.stack([lexcellent, lgood, lfair, lpoor, lbad]) / 100).softmax(0)
-
-        #加权得分
-        weights = self.weights.expand(-1, q_pred.shape[1]).to(video.device)
-        q_pred = torch.mul(q_pred, weights)
-
-        q_pred = torch.sum(q_pred, dim=0)
-
-        return q_pred
+        return score
 
 
-
-
-
-
-
-
+# ==========================================
+# 本地快速测试模块
+# ==========================================
 if __name__=="__main__":
     device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
-    model = T2VQA(med_config='../configs/med_config.json', image_size = 224).to(device)
+    mock_args = {
+        'llm_model': 'LLM-Research/Meta-Llama-3-8B-Instruct', 
+        'blip2_model': 'Salesforce/blip2-opt-2.7b',
+        'bert_weights': 'bert-base-uncased', 
+        'embed_dim': 256,
+        
+        # LLM LoRA 配置
+        'use_lora': True,
+        'lora_r': 16,
+        
+        # --- 视觉编码器 LoRA 新增配置 ---
+        'use_vision_lora': True,
+        'vision_lora_r': 16,
+    }
+    print("=> 正在初始化模型 (测试模式)...")
+    model = T2VQA_Llama3_Blip2(mock_args).to(device)
     model.eval()
+    
     caption = 'A random caption'
-    prompt = 'Please assess the quality of this image'
+    prompt = ['Please assess the quality of this video'] * 2 
     video = torch.randn(2, 3, 8, 224, 224).to(device)
 
+    print("=> 正在执行 Forward 推理测试...")
     with torch.no_grad():
-        output = model(video, caption, prompt)
-    print(output)        
+        with torch.amp.autocast('cuda'):
+            output = model({'video': video}, caption, prompt)
+            
+    print("=> 测试成功! 模型输出分数:", output)

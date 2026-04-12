@@ -52,8 +52,8 @@ model:
         dropout: 0.1
         nlayers: 6
         embed_dim: 256 
-        llm_model: /root/autodl-tmp/model/vicuna-7b-v1.1
-        blip_weights: /root/autodl-tmp/model/model_large.pth
+        llm_model: "meta-llama/Meta-Llama-3-8B-Instruct"  # 或下载到本地的路径
+        blip2_model: "Salesforce/blip2-opt-2.7b"
         swin_weights: /root/autodl-tmp/model/swin_tiny_patch244_window877_kinetics400_1k.pth
         conv_weights: /root/autodl-tmp/model/convnext_3d_tiny_3.pth
         bert_weights: /root/autodl-tmp/model/bert-base-uncased
